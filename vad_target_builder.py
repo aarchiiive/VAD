@@ -256,10 +256,20 @@ class VADTargetBuilder(AbstractTargetBuilder):
             })
 
         # Ego history trajectory (as position offsets)
+        # history_traj = scene.get_history_trajectory()
+        # history_offsets = history_traj.poses.astype(np.float32)
+        # if history_offsets.shape[0] > 1:
+        #     history_deltas = history_offsets[1:, :2] - history_offsets[:-1, :2]
+        # else:
+        #     history_deltas = np.zeros((0, 2), dtype=np.float32)
+        # gt_info["gt_ego_his_trajs"] = torch.tensor(history_deltas, dtype=torch.float32)
+
         history_traj = scene.get_history_trajectory()
         history_offsets = history_traj.poses.astype(np.float32)
         if history_offsets.shape[0] > 1:
-            history_deltas = history_offsets[1:, :2] - history_offsets[:-1, :2]
+            # History should be reversed: older -> newer
+            history_deltas = history_offsets[:-1, :2] - history_offsets[1:, :2]
+            history_deltas = history_deltas[::-1].copy()  # Add .copy() to fix negative stride
         else:
             history_deltas = np.zeros((0, 2), dtype=np.float32)
         gt_info["gt_ego_his_trajs"] = torch.tensor(history_deltas, dtype=torch.float32)
@@ -337,13 +347,14 @@ class VADTargetBuilder(AbstractTargetBuilder):
         agent_future_masks = np.zeros((num_agents, fut_ts), dtype=np.float32)
         agent_future_yaw = np.zeros((num_agents, fut_ts), dtype=np.float32)
 
-        # Get current ego pose for coordinate transformation
         current_ego_pose = StateSE2(*scene.frames[current_idx].ego_status.ego_pose)
 
         for agent_idx, track_token in enumerate(current_annotations.track_tokens):
             current_box = current_annotations.boxes[agent_idx]
-            current_pos = current_box[:2]
-            current_yaw = current_box[6]  # NavSim coordinate system
+            current_local_pos = current_box[:2]
+            prev_global_pos = self._transform_from_ego_frame(current_local_pos, current_ego_pose)
+            prev_pos_current = self._transform_to_ego_frame(prev_global_pos, current_ego_pose)
+            prev_global_yaw = self._wrap_angle(current_box[6] + current_ego_pose.heading)
 
             for fut_step in range(fut_ts):
                 future_idx = current_idx + 1 + fut_step
@@ -357,29 +368,43 @@ class VADTargetBuilder(AbstractTargetBuilder):
 
                 future_agent_idx = future_annotations.track_tokens.index(track_token)
                 future_box = future_annotations.boxes[future_agent_idx]
-                future_pos = future_box[:2]
-                future_yaw = future_box[6]  # NavSim coordinate system
-
-                # Get future ego pose for proper coordinate transformation
+                future_local_pos = future_box[:2]
                 future_ego_pose = StateSE2(*future_frame.ego_status.ego_pose)
 
-                # Transform agent positions to ego-relative coordinates
-                current_pos_ego_rel = self._transform_to_ego_frame(current_pos, current_ego_pose)
-                future_pos_ego_rel = self._transform_to_ego_frame(future_pos, future_ego_pose)
+                future_global_pos = self._transform_from_ego_frame(future_local_pos, future_ego_pose)
+                future_pos_current = self._transform_to_ego_frame(future_global_pos, current_ego_pose)
 
-                # Store trajectory as offset in ego-relative coordinates
-                agent_future_trajs[agent_idx, fut_step] = future_pos_ego_rel - current_pos_ego_rel
+                agent_future_trajs[agent_idx, fut_step] = future_pos_current - prev_pos_current
                 agent_future_masks[agent_idx, fut_step] = 1.0
 
-                # Store yaw as offset (relative to ego heading changes)
-                ego_yaw_diff = future_ego_pose.heading - current_ego_pose.heading
-                agent_future_yaw[agent_idx, fut_step] = (future_yaw - current_yaw) - ego_yaw_diff
+                future_global_yaw = self._wrap_angle(future_box[6] + future_ego_pose.heading)
+                agent_future_yaw[agent_idx, fut_step] = self._wrap_angle(future_global_yaw - prev_global_yaw)
+
+                prev_global_pos = future_global_pos
+                prev_pos_current = future_pos_current
+                prev_global_yaw = future_global_yaw
 
         return {
             "gt_agent_fut_trajs": torch.tensor(agent_future_trajs.reshape(num_agents, -1), dtype=torch.float32),
             "gt_agent_fut_masks": torch.tensor(agent_future_masks, dtype=torch.float32),
             "gt_agent_fut_yaw": torch.tensor(agent_future_yaw, dtype=torch.float32),
         }
+
+    @staticmethod
+    def _transform_from_ego_frame(local_pos: np.ndarray, ego_pose: StateSE2) -> np.ndarray:
+        """
+        Transform position from ego-relative frame to global coordinates.
+
+        Args:
+            local_pos: Position expressed in the ego frame.
+            ego_pose: Ego pose in global coordinates.
+
+        Returns:
+            Position in global coordinates.
+        """
+        cos_h, sin_h = np.cos(ego_pose.heading), np.sin(ego_pose.heading)
+        rotation_matrix = np.array([[cos_h, -sin_h], [sin_h, cos_h]])
+        return rotation_matrix @ local_pos + np.array([ego_pose.x, ego_pose.y])
 
     def _transform_to_ego_frame(self, global_pos: np.ndarray, ego_pose: StateSE2) -> np.ndarray:
         """
@@ -400,6 +425,11 @@ class VADTargetBuilder(AbstractTargetBuilder):
         rotation_matrix = np.array([[cos_h, -sin_h], [sin_h, cos_h]])
 
         return rotation_matrix @ translated
+
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        """Wrap angle to [-pi, pi]."""
+        return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
     def _get_agent_lcf_features(self, scene: Scene, agent_future: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -480,8 +510,18 @@ class VADTargetBuilder(AbstractTargetBuilder):
         ego_status = current_frame.ego_status
 
         # Navigation tokens for temporal relationships
-        prev_token = scene.frames[current_idx - 1].token if current_idx > 0 else ""
-        next_token = scene.frames[current_idx + 1].token if current_idx < len(scene.frames) - 1 else ""
+        # prev_token = scene.frames[current_idx - 1].token if current_idx > 0 else ""
+        # next_token = scene.frames[current_idx + 1].token if current_idx < len(scene.frames) - 1 else ""
+
+        # Navigation tokens for temporal relationships - with proper bounds checking
+        prev_token = ""
+        next_token = ""
+
+        if current_idx > 0 and current_idx - 1 < len(scene.frames):
+            prev_token = scene.frames[current_idx - 1].token
+
+        if current_idx + 1 < len(scene.frames):
+            next_token = scene.frames[current_idx + 1].token
 
         # CAN bus data simulation (18-element array for NuScenes compatibility)
         can_bus = np.zeros(18, dtype=np.float32)
