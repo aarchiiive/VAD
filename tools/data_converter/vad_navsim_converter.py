@@ -466,7 +466,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fut-horizon",
         type=float,
-        default=3.0,
+        default=4.0,
         help="Future trajectory horizon in seconds (must align with model training).",
     )
     parser.add_argument(
