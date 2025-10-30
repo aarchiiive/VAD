@@ -252,6 +252,9 @@ def _scene_to_info(
     else:
         info["can_bus"] = targets_np["can_bus"]
 
+    frame_token = raw_frame["token"]
+    info["local_vector_map"] = target_builder.get_local_vector_map(scene, frame_token)
+
     # Ground-truth fields
     info["fut_valid_flag"] = bool(targets_np["fut_valid_flag"])
     info["gt_boxes"] = targets_np["gt_boxes"]
