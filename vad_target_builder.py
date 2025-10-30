@@ -1,9 +1,13 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
+
+import os
 import cv2
 import numpy as np
 import numpy.typing as npt
+
 import torch
+
 from nuplan.common.actor_state.oriented_box import OrientedBox
 from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
@@ -16,6 +20,9 @@ from navsim.agents.vad.vad_config import VADConfig
 from navsim.common.dataclasses import Annotations, Scene, NAVSIM_INTERVAL_LENGTH
 from navsim.planning.scenario_builder.navsim_scenario_utils import tracked_object_types
 from navsim.planning.training.abstract_feature_target_builder import AbstractTargetBuilder
+
+
+NUPLAN_MAPS_ROOT = os.environ["NUPLAN_MAPS_ROOT"]
 
 
 class VADTargetBuilder(AbstractTargetBuilder):
@@ -663,3 +670,92 @@ class VADTargetBuilder(AbstractTargetBuilder):
         pixel_center = np.array([[0, self._config.bev_pixel_width / 2.0]])
         coords_idcs = (coords / self._config.bev_pixel_size) + pixel_center
         return coords_idcs.astype(np.int32)
+
+    # def get_local_vector_map(
+    #     self,
+    #     scene: Scene,
+    #     frame_token: str,
+    #     radius: float = 50.0,
+    #     layers: List[SemanticMapLayer] = [
+    #         SemanticMapLayer.LANE,
+    #         SemanticMapLayer.LANE_CONNECTOR,
+    #         SemanticMapLayer.ROADBLOCK,
+    #         SemanticMapLayer.CROSSWALK,
+    #     ],
+    # ) -> Dict[SemanticMapLayer, List[Any]]:
+    #     """Retrieve local vector map objects around ego pose for a specific frame."""
+    #     from nuplan.common.actor_state.state_representation import StateSE2
+    #     from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
+
+    #     # Find frame by token
+    #     frame = next((f for f in scene.frames if f.token == frame_token), None)
+    #     if frame is None:
+    #         raise KeyError(f"Frame token {frame_token} not found in scene")
+
+    #     # Ego pose and map API
+    #     ego_pose = StateSE2(*frame.ego_status.ego_pose)
+
+    #     # ✅ FIX: use global NUPLAN_MAPS_ROOT and static version string
+    #     map_api = get_maps_api(
+    #         map_root=NUPLAN_MAPS_ROOT,
+    #         map_version="nuplan-maps-v1.0",
+    #         map_name=scene.scene_metadata.map_name,
+    #     )
+
+    #     # Query nearby vector map objects
+    #     local_map_objects = map_api.get_proximal_map_objects(
+    #         point=ego_pose.point,
+    #         radius=radius,
+    #         layers=layers,
+    #     )
+    #     return local_map_objects
+
+
+    def get_local_vector_map(
+        self,
+        scene: Scene,
+        frame_token: str,
+        radius: float = 50.0,
+        layers: List[SemanticMapLayer] = list(SemanticMapLayer),
+    ) -> Dict[str, Any]:
+        """Retrieve all vector map layers (GeoDataFrames) around ego pose for a specific frame."""
+        from shapely.geometry import box
+        from nuplan.common.actor_state.state_representation import StateSE2
+        from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
+
+        # Find target frame
+        frame = next((f for f in scene.frames if f.token == frame_token), None)
+        if frame is None:
+            raise KeyError(f"Frame token {frame_token} not found in scene")
+
+        # Ego pose and map API
+        ego_pose = StateSE2(*frame.ego_status.ego_pose)
+
+        # Use global map root + fixed version
+        map_api = get_maps_api(
+            map_root=NUPLAN_MAPS_ROOT,
+            map_version="nuplan-maps-v1.0",
+            map_name=scene.scene_metadata.map_name,
+        )
+
+        # Define bounding box around ego position
+        x, y = ego_pose.x, ego_pose.y
+        patch = box(x - radius, y - radius, x + radius, y + radius)
+
+        # Collect vector map layers safely
+        local_map_objects: Dict[str, Any] = {}
+
+        for layer in layers:
+            try:
+                df = map_api._get_vector_map_layer(layer)
+                if "geometry" not in df.columns:
+                    continue
+                # Select features inside patch
+                subset = df[df["geometry"].intersects(patch)]
+                if len(subset) > 0:
+                    local_map_objects[layer.name] = subset
+            except Exception:
+                # Skip unsupported or missing layers
+                continue
+
+        return local_map_objects
