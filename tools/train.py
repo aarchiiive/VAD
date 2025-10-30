@@ -3,7 +3,7 @@
 # ---------------------------------------------
 #  Modified by Zhiqi Li
 # ---------------------------------------------
- 
+
 from __future__ import division
 
 import argparse
@@ -34,6 +34,8 @@ cv2.setNumThreads(1)
 
 import sys
 sys.path.append('')
+
+warnings.filterwarnings('ignore')
 
 
 def parse_args():

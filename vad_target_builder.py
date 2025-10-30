@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple
+
+import cv2
+import numpy as np
+import numpy.typing as npt
+import torch
+from shapely import affinity
+from shapely.geometry import LineString, Polygon
+
+from nuplan.common.actor_state.oriented_box import OrientedBox
+from nuplan.common.actor_state.state_representation import StateSE2
+from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
+from nuplan.common.maps.abstract_map import AbstractMap, SemanticMapLayer
+from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
+
+from navsim.agents.vad.vad_config import VADConfig
+from navsim.common.dataclasses import Annotations, Scene, NAVSIM_INTERVAL_LENGTH
+from navsim.planning.scenario_builder.navsim_scenario_utils import tracked_object_types
+from navsim.planning.training.abstract_feature_target_builder import AbstractTargetBuilder
+
+
+class VADTargetBuilder(AbstractTargetBuilder):
+    """Output target builder for VAD with NuScenes-compatible targets."""
+
+    def __init__(self, trajectory_sampling: TrajectorySampling, config: VADConfig):
+        """
+        Initializes target builder.
+        :param trajectory_sampling: trajectory sampling specification
+        :param config: global config dataclass of VAD
+        """
+        self._trajectory_sampling = trajectory_sampling
+        self._config = config
+
+        # NavSim uses a reduced label set; keep a single authoritative order here.
+        self.category_order: List[TrackedObjectType] = [
+            TrackedObjectType.VEHICLE,
+            TrackedObjectType.PEDESTRIAN,
+            TrackedObjectType.BICYCLE,
+            TrackedObjectType.TRAFFIC_CONE,
+            TrackedObjectType.BARRIER,
+            TrackedObjectType.CZONE_SIGN,
+            TrackedObjectType.GENERIC_OBJECT,
+        ]
+        self.agent_type_mapping = {category.fullname: idx for idx, category in enumerate(self.category_order)}
+        self.category_names = [category.fullname for category in self.category_order]
+
+    def get_unique_name(self) -> str:
+        """Inherited, see superclass."""
+        return "vad_target"
+
+    def compute_targets(self, scene: Scene) -> Dict[str, Any]:
+        """
+        Compute target tensors from the full scene dataclass.
+        :param scene: Scene dataclass containing privileged information.
+        :return: Dictionary with all VAD supervision targets.
+        """
+        targets: Dict[str, Any] = {}
+
+        current_idx = scene.scene_metadata.num_history_frames - 1
+        current_frame = scene.frames[current_idx]
+        annotations = current_frame.annotations
+        ego_pose = StateSE2(*current_frame.ego_status.ego_pose)
+
+        # Core VAD targets (trajectory, detections, semantic map)
+        targets["trajectory"] = torch.tensor(
+            scene.get_future_trajectory(num_trajectory_frames=self._trajectory_sampling.num_poses).poses,
+            dtype=torch.float32,
+        )
+
+        agent_states, agent_labels = self._compute_agent_targets(annotations)
+        targets["agent_states"] = agent_states
+        targets["agent_labels"] = agent_labels
+        targets["bev_semantic_map"] = self._compute_bev_semantic_map(annotations, scene.map_api, ego_pose)
+
+        # Scene-level GT
+        targets.update(self._get_scene_gt_info(scene))
+
+        # Agent futures
+        agent_future = self._get_agent_future_trajectories(scene)
+        targets.update(agent_future)
+
+        # Additional agent feature targets (uses future info)
+        targets.update(self._get_agent_lcf_features(scene, agent_future))
+
+        # Compatibility and bookkeeping information
+        targets.update(self._get_nuscenes_compatibility_info(scene))
+
+        return targets
+
+    # ------------------------------------------------------------------
+    # Agent targets
+    # ------------------------------------------------------------------
+    def _compute_agent_targets(self, annotations: Annotations) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract 2D agent bounding boxes in ego coordinates."""
+        max_agents = getattr(self._config, "num_bounding_boxes", 200)
+        agent_states_list: List[npt.NDArray[np.float32]] = []
+
+        def _xy_in_lidar(x: float, y: float) -> bool:
+            return (
+                getattr(self._config, "lidar_min_x", -50.0) <= x <= getattr(self._config, "lidar_max_x", 50.0)
+                and getattr(self._config, "lidar_min_y", -50.0) <= y <= getattr(self._config, "lidar_max_y", 50.0)
+            )
+
+        if annotations is not None:
+            for box, name in zip(annotations.boxes, annotations.names):
+                box_x, box_y = box[0], box[1]
+                if name == "vehicle" and _xy_in_lidar(box_x, box_y):
+                    box_heading = box[6]
+                    box_length = box[3]
+                    box_width = box[4]
+                    agent_states_list.append(
+                        np.array([box_x, box_y, box_heading, box_length, box_width], dtype=np.float32)
+                    )
+
+        agents_states_arr = np.array(agent_states_list)
+        agent_states = np.zeros((max_agents, 5), dtype=np.float32)
+        agent_labels = np.zeros(max_agents, dtype=bool)
+
+        if len(agents_states_arr) > 0:
+            distances = np.linalg.norm(agents_states_arr[:, :2], axis=-1)
+            argsort = np.argsort(distances)[:max_agents]
+            agents_states_arr = agents_states_arr[argsort]
+            agent_states[: len(agents_states_arr)] = agents_states_arr
+            agent_labels[: len(agents_states_arr)] = True
+
+        return torch.tensor(agent_states, dtype=torch.float32), torch.tensor(agent_labels, dtype=torch.bool)
+
+    def _compute_bev_semantic_map(
+        self, annotations: Annotations, map_api: AbstractMap, ego_pose: StateSE2
+    ) -> torch.Tensor:
+        """Creates semantic map in BEV following configured layers."""
+        bev_semantic_map = np.zeros(self._config.bev_semantic_frame, dtype=np.int64)
+
+        if map_api is not None:
+            for label, (entity_type, layers) in self._config.bev_semantic_classes.items():
+                if entity_type == "polygon":
+                    entity_mask = self._compute_map_polygon_mask(map_api, ego_pose, layers)
+                elif entity_type == "linestring":
+                    entity_mask = self._compute_map_linestring_mask(map_api, ego_pose, layers)
+                else:
+                    entity_mask = self._compute_box_mask(annotations, layers)
+                bev_semantic_map[entity_mask] = label
+
+        return torch.tensor(bev_semantic_map, dtype=torch.int64)
+
+    # ------------------------------------------------------------------
+    # Scene-level GT (ego trajectories, boxes, etc.)
+    # ------------------------------------------------------------------
+    def _get_scene_gt_info(self, scene: Scene) -> Dict[str, Any]:
+        """Extract ground-truth metadata and ego trajectories."""
+        current_idx = scene.scene_metadata.num_history_frames - 1
+        current_frame = scene.frames[current_idx]
+        annotations = current_frame.annotations
+        ego_status = current_frame.ego_status
+
+        gt_info: Dict[str, Any] = {
+            "scene_token": scene.scene_metadata.scene_token,
+            "log_name": scene.scene_metadata.log_name,
+            "map_location": scene.scene_metadata.map_name,
+            "timestamp": torch.tensor(current_frame.timestamp, dtype=torch.int64),
+            "roadblock_ids": current_frame.roadblock_ids,
+            "traffic_lights": current_frame.traffic_lights,
+        }
+
+        if annotations is not None and len(annotations.boxes) > 0:
+            gt_boxes_nuscenes = np.zeros((len(annotations.boxes), 7), dtype=np.float32)
+            gt_names: List[str] = []
+
+            for i, (box, name) in enumerate(zip(annotations.boxes, annotations.names)):
+                gt_boxes_nuscenes[i, 0:3] = box[0:3]
+                gt_boxes_nuscenes[i, 3] = box[4]  # width
+                gt_boxes_nuscenes[i, 4] = box[3]  # length
+                gt_boxes_nuscenes[i, 5] = box[5]  # height
+                gt_boxes_nuscenes[i, 6] = -box[6] - np.pi / 2
+
+                mapped_idx = self.agent_type_mapping.get(name)
+                if mapped_idx is not None and mapped_idx < len(self.category_names):
+                    gt_names.append(self.category_names[mapped_idx])
+                else:
+                    gt_names.append(name)
+
+            gt_info.update(
+                {
+                    "gt_boxes": torch.tensor(gt_boxes_nuscenes, dtype=torch.float32),
+                    "gt_names": gt_names,
+                    "gt_velocity_3d": torch.tensor(annotations.velocity_3d, dtype=torch.float32),
+                    "gt_velocity": torch.tensor(annotations.velocity_3d[:, :2], dtype=torch.float32),
+                    "instance_tokens": annotations.instance_tokens,
+                    "track_tokens": annotations.track_tokens,
+                    "num_agents": torch.tensor(len(annotations.boxes), dtype=torch.int64),
+                    "valid_flag": torch.ones(len(annotations.boxes), dtype=torch.bool),
+                    "num_lidar_pts": torch.zeros(len(annotations.boxes), dtype=torch.int64),
+                    "num_radar_pts": torch.zeros(len(annotations.boxes), dtype=torch.int64),
+                }
+            )
+        else:
+            gt_info.update(
+                {
+                    "gt_boxes": torch.zeros((0, 7), dtype=torch.float32),
+                    "gt_names": [],
+                    "gt_velocity_3d": torch.zeros((0, 3), dtype=torch.float32),
+                    "gt_velocity": torch.zeros((0, 2), dtype=torch.float32),
+                    "instance_tokens": [],
+                    "track_tokens": [],
+                    "num_agents": torch.tensor(0, dtype=torch.int64),
+                    "valid_flag": torch.zeros((0,), dtype=torch.bool),
+                    "num_lidar_pts": torch.zeros((0,), dtype=torch.int64),
+                    "num_radar_pts": torch.zeros((0,), dtype=torch.int64),
+                }
+            )
+
+        # Ego history offsets
+        history_traj = scene.get_history_trajectory()
+        history_offsets = history_traj.poses.astype(np.float32)
+        if history_offsets.shape[0] > 1:
+            history_deltas = history_offsets[1:, :2] - history_offsets[:-1, :2]
+        else:
+            history_deltas = np.zeros((0, 2), dtype=np.float32)
+        gt_info["gt_ego_his_trajs"] = torch.tensor(history_deltas, dtype=torch.float32)
+
+        # Ego future offsets and masks
+        future_traj = scene.get_future_trajectory(num_trajectory_frames=self._trajectory_sampling.num_poses)
+        future_offsets = future_traj.poses.astype(np.float32)
+        if future_offsets.shape[0] > 1:
+            ego_fut_trajs = future_offsets[1:, :2] - future_offsets[:-1, :2]
+        else:
+            ego_fut_trajs = np.zeros((0, 2), dtype=np.float32)
+        gt_info["gt_ego_fut_trajs"] = torch.tensor(ego_fut_trajs, dtype=torch.float32)
+        gt_info["gt_ego_fut_masks"] = torch.ones(future_offsets.shape[0] - 1, dtype=torch.float32)
+
+        # Driving command (one hot) derived from final offset
+        if future_offsets.shape[0] > 0:
+            final_offset = future_offsets[-1]
+            if final_offset[0] >= 2.0:
+                ego_cmd = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            elif final_offset[0] <= -2.0:
+                ego_cmd = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            else:
+                ego_cmd = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        else:
+            ego_cmd = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        gt_info["gt_ego_fut_cmd"] = torch.tensor(ego_cmd, dtype=torch.float32)
+        gt_info["fut_valid_flag"] = torch.tensor(True, dtype=torch.bool)
+
+        # Ego LCF feature (vx, vy, ax, ay, yaw_rate, length, width, speed, curvature)
+        ego_lcf_feat = np.zeros(9, dtype=np.float32)
+        ego_lcf_feat[0:2] = ego_status.ego_velocity
+        ego_lcf_feat[2:4] = ego_status.ego_acceleration
+
+        if future_offsets.shape[0] > 1:
+            yaw_diff = future_offsets[1, 2] - future_offsets[0, 2]
+            ego_lcf_feat[4] = yaw_diff / NAVSIM_INTERVAL_LENGTH
+        else:
+            ego_lcf_feat[4] = 0.0
+
+        ego_lcf_feat[5] = 5.176  # ego length
+        ego_lcf_feat[6] = 2.297  # ego width
+        ego_lcf_feat[7] = np.linalg.norm(ego_status.ego_velocity)
+        ego_lcf_feat[8] = 0.0  # curvature placeholder
+        gt_info["gt_ego_lcf_feat"] = torch.tensor(ego_lcf_feat, dtype=torch.float32)
+
+        return gt_info
+
+    # ------------------------------------------------------------------
+    # Agent future trajectories
+    # ------------------------------------------------------------------
+    def _get_agent_future_trajectories(self, scene: Scene) -> Dict[str, Any]:
+        """Extract agent future trajectories using consistent track tokens."""
+        current_idx = scene.scene_metadata.num_history_frames - 1
+        current_annotations = scene.frames[current_idx].annotations
+
+        fut_ts = self._trajectory_sampling.num_poses
+
+        if current_annotations is None or len(current_annotations.track_tokens) == 0:
+            return {
+                "gt_agent_fut_trajs": torch.zeros((0, fut_ts * 2), dtype=torch.float32),
+                "gt_agent_fut_masks": torch.zeros((0, fut_ts), dtype=torch.float32),
+                "gt_agent_fut_yaw": torch.zeros((0, fut_ts), dtype=torch.float32),
+            }
+
+        num_agents = len(current_annotations.track_tokens)
+        gt_agent_fut_trajs = np.zeros((num_agents, fut_ts, 2), dtype=np.float32)
+        gt_agent_fut_masks = np.zeros((num_agents, fut_ts), dtype=np.float32)
+        gt_agent_fut_yaw = np.zeros((num_agents, fut_ts), dtype=np.float32)
+
+        for agent_idx, track_token in enumerate(current_annotations.track_tokens):
+            current_box = current_annotations.boxes[agent_idx]
+            current_pos = current_box[:2]
+            current_yaw = current_box[6]
+
+            for fut_step in range(fut_ts):
+                future_idx = current_idx + 1 + fut_step
+                if future_idx >= len(scene.frames):
+                    break
+
+                future_frame = scene.frames[future_idx]
+                future_annotations = future_frame.annotations
+                if future_annotations is None or track_token not in future_annotations.track_tokens:
+                    break
+
+                future_agent_idx = future_annotations.track_tokens.index(track_token)
+                future_box = future_annotations.boxes[future_agent_idx]
+                future_pos = future_box[:2]
+                future_yaw = future_box[6]
+
+                gt_agent_fut_trajs[agent_idx, fut_step] = future_pos - current_pos
+                gt_agent_fut_masks[agent_idx, fut_step] = 1.0
+                gt_agent_fut_yaw[agent_idx, fut_step] = future_yaw - current_yaw
+
+        return {
+            "gt_agent_fut_trajs": torch.tensor(gt_agent_fut_trajs.reshape(num_agents, -1), dtype=torch.float32),
+            "gt_agent_fut_masks": torch.tensor(gt_agent_fut_masks, dtype=torch.float32),
+            "gt_agent_fut_yaw": torch.tensor(gt_agent_fut_yaw, dtype=torch.float32),
+        }
+
+    # ------------------------------------------------------------------
+    # Agent LCF features / goal classification
+    # ------------------------------------------------------------------
+    def _get_agent_lcf_features(self, scene: Scene, agent_future: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute agent latent curve features leveraging future predictions."""
+        current_idx = scene.scene_metadata.num_history_frames - 1
+        annotations = scene.frames[current_idx].annotations
+
+        if annotations is None or len(annotations.boxes) == 0:
+            return {
+                "gt_agent_lcf_feat": torch.zeros((0, 9), dtype=torch.float32),
+                "gt_agent_fut_goal": torch.zeros((0,), dtype=torch.float32),
+            }
+
+        num_agents = len(annotations.boxes)
+        agent_lcf_feat = np.zeros((num_agents, 9), dtype=np.float32)
+
+        for i, (box, name) in enumerate(zip(annotations.boxes, annotations.names)):
+            agent_lcf_feat[i, 0:2] = box[:2]
+            agent_lcf_feat[i, 2] = box[6]
+            agent_lcf_feat[i, 3:5] = annotations.velocity_3d[i, :2]
+            agent_lcf_feat[i, 5] = box[4]
+            agent_lcf_feat[i, 6] = box[3]
+            agent_lcf_feat[i, 7] = box[5]
+            agent_lcf_feat[i, 8] = float(self.agent_type_mapping.get(name, -1))
+
+        gt_agent_fut_goal = np.zeros(num_agents, dtype=np.float32)
+        fut_trajs_tensor = agent_future["gt_agent_fut_trajs"]
+        fut_trajs_np = fut_trajs_tensor.reshape(num_agents, -1, 2).cpu().numpy() if num_agents > 0 else np.zeros(
+            (0, self._trajectory_sampling.num_poses, 2), dtype=np.float32
+        )
+
+        for i in range(num_agents):
+            traj = fut_trajs_np[i]
+            if traj.size == 0:
+                gt_agent_fut_goal[i] = 9
+                continue
+
+            cumulative = np.cumsum(traj, axis=0)
+            final_offset = cumulative[-1] if cumulative.size > 0 else np.zeros(2, dtype=np.float32)
+
+            if np.linalg.norm(final_offset) < 1.0:
+                gt_agent_fut_goal[i] = 9  # static class
+            else:
+                goal_yaw = np.arctan2(final_offset[1], final_offset[0]) + np.pi
+                gt_agent_fut_goal[i] = np.floor(goal_yaw / (np.pi / 4.0)) % 8
+
+        return {
+            "gt_agent_lcf_feat": torch.tensor(agent_lcf_feat, dtype=torch.float32),
+            "gt_agent_fut_goal": torch.tensor(gt_agent_fut_goal, dtype=torch.float32),
+        }
+
+    # ------------------------------------------------------------------
+    # Compatibility helpers
+    # ------------------------------------------------------------------
+    def _get_nuscenes_compatibility_info(self, scene: Scene) -> Dict[str, Any]:
+        """Collect additional metadata for NuScenes-style consumption."""
+        current_idx = scene.scene_metadata.num_history_frames - 1
+        current_frame = scene.frames[current_idx]
+        ego_status = current_frame.ego_status
+
+        prev_token = scene.frames[current_idx - 1].token if current_idx > 0 else ""
+        next_token = scene.frames[current_idx + 1].token if current_idx < len(scene.frames) - 1 else ""
+
+        can_bus = np.zeros(18, dtype=np.float32)
+        can_bus[0:2] = ego_status.ego_pose[:2]
+        can_bus[3:7] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        can_bus[7:9] = ego_status.ego_acceleration
+        can_bus[13:15] = ego_status.ego_velocity
+
+        return {
+            "token": current_frame.token,
+            "prev": prev_token,
+            "next": next_token,
+            "can_bus": torch.tensor(can_bus, dtype=torch.float32),
+            "frame_idx": torch.tensor(current_idx, dtype=torch.int64),
+            # Placeholders for coordinate transforms (handled in converter)
+            "lidar2ego_translation": torch.zeros(3, dtype=torch.float32),
+            "lidar2ego_rotation": torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+            "ego2global_translation": torch.tensor(ego_status.ego_pose[:3], dtype=torch.float32),
+            "ego2global_rotation": torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32),
+            "sweeps": [],
+        }
+
+    # ------------------------------------------------------------------
+    # Map helper methods
+    # ------------------------------------------------------------------
+    def _get_agent_type_id(self, agent_name: str) -> int:
+        """Map agent name to type ID."""
+        return self.agent_type_mapping.get(agent_name, -1)
+
+    def _compute_map_polygon_mask(
+        self, map_api: AbstractMap, ego_pose: StateSE2, layers: List[SemanticMapLayer]
+    ) -> npt.NDArray[np.bool_]:
+        map_object_dict = map_api.get_proximal_map_objects(point=ego_pose.point, radius=self._config.bev_radius, layers=layers)
+        mask = np.zeros(self._config.bev_semantic_frame[::-1], dtype=np.uint8)
+        for layer in layers:
+            for map_object in map_object_dict[layer]:
+                polygon: Polygon = self._geometry_local_coords(map_object.polygon, ego_pose)
+                exterior = np.array(polygon.exterior.coords).reshape((-1, 1, 2))
+                exterior = self._coords_to_pixel(exterior)
+                cv2.fillPoly(mask, [exterior], color=255)
+        mask = np.rot90(mask)[::-1]
+        return mask > 0
+
+    def _compute_map_linestring_mask(
+        self, map_api: AbstractMap, ego_pose: StateSE2, layers: List[SemanticMapLayer]
+    ) -> npt.NDArray[np.bool_]:
+        map_object_dict = map_api.get_proximal_map_objects(point=ego_pose.point, radius=self._config.bev_radius, layers=layers)
+        mask = np.zeros(self._config.bev_semantic_frame[::-1], dtype=np.uint8)
+        for layer in layers:
+            for map_object in map_object_dict[layer]:
+                linestring: LineString = self._geometry_local_coords(map_object.baseline_path.linestring, ego_pose)
+                points = np.array(linestring.coords).reshape((-1, 1, 2))
+                points = self._coords_to_pixel(points)
+                cv2.polylines(mask, [points], isClosed=False, color=255, thickness=2)
+        mask = np.rot90(mask)[::-1]
+        return mask > 0
+
+    def _compute_box_mask(self, annotations: Annotations, layers: TrackedObjectType) -> npt.NDArray[np.bool_]:
+        mask = np.zeros(self._config.bev_semantic_frame[::-1], dtype=np.uint8)
+        if annotations is not None:
+            for name, box_value in zip(annotations.names, annotations.boxes):
+                agent_type = tracked_object_types[name]
+                if agent_type in layers:
+                    x, y, heading = box_value[0], box_value[1], box_value[-1]
+                    box_length, box_width, box_height = box_value[3], box_value[4], box_value[5]
+                    agent_box = OrientedBox(StateSE2(x, y, heading), box_length, box_width, box_height)
+                    exterior = np.array(agent_box.geometry.exterior.coords).reshape((-1, 1, 2))
+                    exterior = self._coords_to_pixel(exterior)
+                    cv2.fillPoly(mask, [exterior], color=255)
+        mask = np.rot90(mask)[::-1]
+        return mask > 0
+
+    @staticmethod
+    def _geometry_local_coords(geometry: Any, origin: StateSE2) -> Any:
+        a, b = np.cos(origin.heading), np.sin(origin.heading)
+        d, e = -np.sin(origin.heading), np.cos(origin.heading)
+        translated = affinity.affine_transform(geometry, [1, 0, 0, 1, -origin.x, -origin.y])
+        rotated = affinity.affine_transform(translated, [a, b, d, e, 0, 0])
+        return rotated
+
+    def _coords_to_pixel(self, coords: npt.NDArray[np.float32]) -> npt.NDArray[np.int32]:
+        pixel_center = np.array([[0, self._config.bev_pixel_width / 2.0]])
+        coords_idcs = (coords / self._config.bev_pixel_size) + pixel_center
+        return coords_idcs.astype(np.int32)

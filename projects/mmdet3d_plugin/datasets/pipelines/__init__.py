@@ -1,14 +1,14 @@
 from .transform_3d import (
-    PadMultiViewImage, NormalizeMultiviewImage, 
+    PadMultiViewImage, NormalizeMultiviewImage,
     PhotoMetricDistortionMultiViewImage, CustomCollect3D,
     RandomScaleImageMultiViewImage, CustomObjectRangeFilter, CustomObjectNameFilter)
 from .formating import CustomDefaultFormatBundle3D
-from .loading import CustomLoadPointsFromFile, CustomLoadPointsFromMultiSweeps
+from .loading import CustomLoadMultiViewImageFromFiles, CustomLoadPointsFromFile, CustomLoadPointsFromMultiSweeps
 
 __all__ = [
-    'PadMultiViewImage', 'NormalizeMultiviewImage', 
+    'PadMultiViewImage', 'NormalizeMultiviewImage',
     'PhotoMetricDistortionMultiViewImage', 'CustomDefaultFormatBundle3D',
-    'CustomCollect3D', 'RandomScaleImageMultiViewImage', 
+    'CustomCollect3D', 'RandomScaleImageMultiViewImage',
     'CustomObjectRangeFilter', 'CustomObjectNameFilter',
-    'CustomLoadPointsFromFile', 'CustomLoadPointsFromMultiSweeps'
+    'CustomLoadMultiViewImageFromFiles', 'CustomLoadPointsFromFile', 'CustomLoadPointsFromMultiSweeps'
 ]

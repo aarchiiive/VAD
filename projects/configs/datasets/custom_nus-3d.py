@@ -34,9 +34,10 @@ train_pipeline = [
         use_dim=5,
         file_client_args=file_client_args),
     dict(
-        type='LoadPointsFromMultiSweeps',
+        type='CustomLoadPointsFromMultiSweeps',
         sweeps_num=10,
-        file_client_args=file_client_args),
+        file_client_args=file_client_args,
+        num_workers=4),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(
         type='GlobalRotScaleTrans',
@@ -59,9 +60,10 @@ test_pipeline = [
         use_dim=5,
         file_client_args=file_client_args),
     dict(
-        type='LoadPointsFromMultiSweeps',
+        type='CustomLoadPointsFromMultiSweeps',
         sweeps_num=10,
-        file_client_args=file_client_args),
+        file_client_args=file_client_args,
+        num_workers=4),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -93,9 +95,10 @@ eval_pipeline = [
         use_dim=5,
         file_client_args=file_client_args),
     dict(
-        type='LoadPointsFromMultiSweeps',
+        type='CustomLoadPointsFromMultiSweeps',
         sweeps_num=10,
-        file_client_args=file_client_args),
+        file_client_args=file_client_args,
+        num_workers=4),
     dict(
         type='DefaultFormatBundle3D',
         class_names=class_names,

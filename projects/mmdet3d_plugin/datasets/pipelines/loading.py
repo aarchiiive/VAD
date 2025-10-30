@@ -7,11 +7,86 @@ import numpy as np
 from nuscenes.map_expansion.map_api import NuScenesMap
 from nuscenes.map_expansion.map_api import locations as LOCATIONS
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor
 
 
 from mmdet3d.core.points import BasePoints, get_points_type
 from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import LoadAnnotations
+
+
+@PIPELINES.register_module()
+class CustomLoadMultiViewImageFromFiles(object):
+    """Load multi channel images from a list of separate channel files.
+
+    Expects results['img_filename'] to be a list of filenames.
+
+    Args:
+        to_float32 (bool): Whether to convert the img to float32.
+            Defaults to False.
+        color_type (str): Color type of the file. Defaults to 'unchanged'.
+    """
+
+    def __init__(self, to_float32=False, color_type='unchanged', num_workers=1):
+        self.to_float32 = to_float32
+        self.color_type = color_type
+        self.num_workers = max(1, int(num_workers))
+
+    def _read_image(self, path):
+        return mmcv.imread(path, self.color_type)
+
+    def __call__(self, results):
+        """Call function to load multi-view image from files.
+
+        Args:
+            results (dict): Result dict containing multi-view image filenames.
+
+        Returns:
+            dict: The result dict containing the multi-view image data. \
+                Added keys and values are described below.
+
+                - filename (str): Multi-view image filenames.
+                - img (np.ndarray): Multi-view image arrays.
+                - img_shape (tuple[int]): Shape of multi-view image arrays.
+                - ori_shape (tuple[int]): Shape of original image arrays.
+                - pad_shape (tuple[int]): Shape of padded image arrays.
+                - scale_factor (float): Scale factor.
+                - img_norm_cfg (dict): Normalization configuration of images.
+        """
+        filename = results['img_filename']
+        # img is of shape (h, w, c, num_views)
+        if self.num_workers > 1 and len(filename) > 1:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                img_list = list(pool.map(self._read_image, filename))
+        else:
+            img_list = [self._read_image(name) for name in filename]
+        img = np.stack(img_list, axis=-1)
+        if self.to_float32:
+            img = img.astype(np.float32)
+        results['filename'] = filename
+        # unravel to list, see `DefaultFormatBundle` in formating.py
+        # which will transpose each image separately and then stack into array
+        results['img'] = [img[..., i] for i in range(img.shape[-1])]
+        results['img_shape'] = img.shape
+        results['ori_shape'] = img.shape
+        # Set initial values for default meta_keys
+        results['pad_shape'] = img.shape
+        results['scale_factor'] = 1.0
+        num_channels = 1 if len(img.shape) < 3 else img.shape[2]
+        results['img_norm_cfg'] = dict(
+            mean=np.zeros(num_channels, dtype=np.float32),
+            std=np.ones(num_channels, dtype=np.float32),
+            to_rgb=False)
+        return results
+
+    def __repr__(self):
+        """str: Return a string that describes the module."""
+        repr_str = self.__class__.__name__
+        repr_str += f'(to_float32={self.to_float32}, '
+        repr_str += f"color_type='{self.color_type}', "
+        repr_str += f'num_workers={self.num_workers})'
+        return repr_str
+
 
 def load_augmented_point_cloud(path, virtual=False, reduce_beams=32):
     # NOTE: following Tianwei's implementation, it is hard coded for nuScenes
@@ -141,6 +216,7 @@ class CustomLoadPointsFromMultiSweeps:
         test_mode=False,
         load_augmented=None,
         reduce_beams=None,
+        num_workers=1,
     ):
         self.load_dim = load_dim
         self.sweeps_num = sweeps_num
@@ -152,6 +228,7 @@ class CustomLoadPointsFromMultiSweeps:
         self.test_mode = test_mode
         self.load_augmented = load_augmented
         self.reduce_beams = reduce_beams
+        self.num_workers = max(1, int(num_workers))
 
     def _load_points(self, lidar_path):
         """Private function to load point clouds data.
@@ -237,9 +314,25 @@ class CustomLoadPointsFromMultiSweeps:
                     choices = np.random.choice(
                         len(results["sweeps"]) - 1, self.sweeps_num, replace=False
                     )
+            choices = list(np.array(choices).tolist())
+            loaded_points = {}
+
+            def _load_single(idx):
+                sweep = results["sweeps"][idx]
+                return idx, self._load_points(sweep["data_path"])
+
+            if self.num_workers > 1 and len(choices) > 1:
+                with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                    for idx, pts in pool.map(_load_single, choices):
+                        loaded_points[idx] = pts
+            else:
+                for idx in choices:
+                    _, pts = _load_single(idx)
+                    loaded_points[idx] = pts
+
             for idx in choices:
                 sweep = results["sweeps"][idx]
-                points_sweep = self._load_points(sweep["data_path"])
+                points_sweep = loaded_points[idx]
                 points_sweep = np.copy(points_sweep).reshape(-1, self.load_dim)
 
                 # TODO: make it more general
@@ -264,7 +357,10 @@ class CustomLoadPointsFromMultiSweeps:
 
     def __repr__(self):
         """str: Return a string that describes the module."""
-        return f"{self.__class__.__name__}(sweeps_num={self.sweeps_num})"
+        return (
+            f"{self.__class__.__name__}(sweeps_num={self.sweeps_num}, "
+            f"num_workers={self.num_workers})"
+        )
 
 
 

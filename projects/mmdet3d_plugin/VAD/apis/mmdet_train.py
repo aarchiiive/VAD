@@ -31,7 +31,7 @@ def custom_train_detector(model,
     logger = get_root_logger(cfg.log_level)
 
     # prepare data loaders
-   
+
     dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
     #assert len(dataset)==1s
     if 'imgs_per_gpu' in cfg.data:
@@ -53,6 +53,7 @@ def custom_train_detector(model,
             ds,
             cfg.data.samples_per_gpu,
             cfg.data.workers_per_gpu,
+            cfg.data.prefetch_factor,
             # cfg.gpus will be ignored if distributed
             len(cfg.gpu_ids),
             dist=distributed,
@@ -137,12 +138,12 @@ def custom_train_detector(model,
     runner.register_training_hooks(cfg.lr_config, optimizer_config,
                                    cfg.checkpoint_config, cfg.log_config,
                                    cfg.get('momentum_config', None))
-    
+
     # register profiler hook
     #trace_config = dict(type='tb_trace', dir_name='work_dir')
     #profiler_config = dict(on_trace_ready=trace_config)
     #runner.register_profiler_hook(profiler_config)
-    
+
     if distributed:
         if isinstance(runner, EpochBasedRunner):
             runner.register_hook(DistSamplerSeedHook())

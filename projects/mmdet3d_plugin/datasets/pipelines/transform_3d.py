@@ -5,6 +5,7 @@ from mmdet.datasets.builder import PIPELINES
 from mmcv.parallel import DataContainer as DC
 from mmdet3d.core.bbox import (CameraInstance3DBoxes, DepthInstance3DBoxes,
                                LiDARInstance3DBoxes, box_np_ops)
+from concurrent.futures import ThreadPoolExecutor
 
 
 @PIPELINES.register_module()
@@ -112,23 +113,30 @@ class PadMultiViewImage(object):
         pad_val (float, optional): Padding value, 0 by default.
     """
 
-    def __init__(self, size=None, size_divisor=None, pad_val=0):
+    def __init__(self, size=None, size_divisor=None, pad_val=0, num_workers=1):
         self.size = size
         self.size_divisor = size_divisor
         self.pad_val = pad_val
+        self.num_workers = max(1, int(num_workers))
         # only one of size and size_divisor should be valid
         assert size is not None or size_divisor is not None
         assert size is None or size_divisor is None
 
+    def _pad_single(self, img):
+        if self.size is not None:
+            return mmcv.impad(img, shape=self.size, pad_val=self.pad_val)
+        return mmcv.impad_to_multiple(
+            img, self.size_divisor, pad_val=self.pad_val)
+
     def _pad_img(self, results):
         """Pad images according to ``self.size``."""
-        if self.size is not None:
-            padded_img = [mmcv.impad(
-                img, shape=self.size, pad_val=self.pad_val) for img in results['img']]
-        elif self.size_divisor is not None:
-            padded_img = [mmcv.impad_to_multiple(
-                img, self.size_divisor, pad_val=self.pad_val) for img in results['img']]
-        
+        imgs = results['img']
+        if self.num_workers > 1 and len(imgs) > 1:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                padded_img = list(pool.map(self._pad_single, imgs))
+        else:
+            padded_img = [self._pad_single(img) for img in imgs]
+
         results['ori_shape'] = [img.shape for img in results['img']]
         results['img'] = padded_img
         results['img_shape'] = [img.shape for img in padded_img]
@@ -150,7 +158,8 @@ class PadMultiViewImage(object):
         repr_str = self.__class__.__name__
         repr_str += f'(size={self.size}, '
         repr_str += f'size_divisor={self.size_divisor}, '
-        repr_str += f'pad_val={self.pad_val})'
+        repr_str += f'pad_val={self.pad_val}, '
+        repr_str += f'num_workers={self.num_workers})'
         return repr_str
 
 
@@ -165,11 +174,14 @@ class NormalizeMultiviewImage(object):
             default is true.
     """
 
-    def __init__(self, mean, std, to_rgb=True):
+    def __init__(self, mean, std, to_rgb=True, num_workers=1):
         self.mean = np.array(mean, dtype=np.float32)
         self.std = np.array(std, dtype=np.float32)
         self.to_rgb = to_rgb
+        self.num_workers = max(1, int(num_workers))
 
+    def _normalize_single(self, img):
+        return mmcv.imnormalize(img, self.mean, self.std, self.to_rgb)
 
     def __call__(self, results):
         """Call function to normalize images.
@@ -180,14 +192,20 @@ class NormalizeMultiviewImage(object):
                 result dict.
         """
 
-        results['img'] = [mmcv.imnormalize(img, self.mean, self.std, self.to_rgb) for img in results['img']]
+        imgs = results['img']
+        if self.num_workers > 1 and len(imgs) > 1:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                results['img'] = list(pool.map(self._normalize_single, imgs))
+        else:
+            results['img'] = [self._normalize_single(img) for img in imgs]
         results['img_norm_cfg'] = dict(
             mean=self.mean, std=self.std, to_rgb=self.to_rgb)
         return results
 
     def __repr__(self):
         repr_str = self.__class__.__name__
-        repr_str += f'(mean={self.mean}, std={self.std}, to_rgb={self.to_rgb})'
+        repr_str += f'(mean={self.mean}, std={self.std}, '
+        repr_str += f'to_rgb={self.to_rgb}, num_workers={self.num_workers})'
         return repr_str
 
 
@@ -215,11 +233,49 @@ class PhotoMetricDistortionMultiViewImage:
                  brightness_delta=32,
                  contrast_range=(0.5, 1.5),
                  saturation_range=(0.5, 1.5),
-                 hue_delta=18):
+                 hue_delta=18,
+                 num_workers=1):
         self.brightness_delta = brightness_delta
         self.contrast_lower, self.contrast_upper = contrast_range
         self.saturation_lower, self.saturation_upper = saturation_range
         self.hue_delta = hue_delta
+        self.num_workers = max(1, int(num_workers))
+
+    def _distort_single(self, img, seed):
+        rng = np.random.RandomState(seed)
+        img = img.copy()
+        if rng.randint(2):
+            delta = rng.uniform(-self.brightness_delta, self.brightness_delta)
+            img += delta
+
+        mode = rng.randint(2)
+        if mode == 1:
+            if rng.randint(2):
+                alpha = rng.uniform(self.contrast_lower, self.contrast_upper)
+                img *= alpha
+
+        img = mmcv.bgr2hsv(img)
+
+        if rng.randint(2):
+            img[..., 1] *= rng.uniform(self.saturation_lower,
+                                       self.saturation_upper)
+
+        if rng.randint(2):
+            img[..., 0] += rng.uniform(-self.hue_delta, self.hue_delta)
+            img[..., 0][img[..., 0] > 360] -= 360
+            img[..., 0][img[..., 0] < 0] += 360
+
+        img = mmcv.hsv2bgr(img)
+
+        if mode == 0:
+            if rng.randint(2):
+                alpha = rng.uniform(self.contrast_lower, self.contrast_upper)
+                img *= alpha
+
+        if rng.randint(2):
+            img = img[..., rng.permutation(3)]
+
+        return img
 
     def __call__(self, results):
         """Call function to perform photometric distortion on images.
@@ -229,55 +285,22 @@ class PhotoMetricDistortionMultiViewImage:
             dict: Result dict with images distorted.
         """
         imgs = results['img']
-        new_imgs = []
+        seeds = random.randint(0, 2**32 - 1, size=len(imgs))
         for img in imgs:
             assert img.dtype == np.float32, \
                 'PhotoMetricDistortion needs the input image of dtype np.float32,'\
                 ' please set "to_float32=True" in "LoadImageFromFile" pipeline'
-            # random brightness
-            if random.randint(2):
-                delta = random.uniform(-self.brightness_delta,
-                                    self.brightness_delta)
-                img += delta
 
-            # mode == 0 --> do random contrast first
-            # mode == 1 --> do random contrast last
-            mode = random.randint(2)
-            if mode == 1:
-                if random.randint(2):
-                    alpha = random.uniform(self.contrast_lower,
-                                        self.contrast_upper)
-                    img *= alpha
-
-            # convert color from BGR to HSV
-            img = mmcv.bgr2hsv(img)
-
-            # random saturation
-            if random.randint(2):
-                img[..., 1] *= random.uniform(self.saturation_lower,
-                                            self.saturation_upper)
-
-            # random hue
-            if random.randint(2):
-                img[..., 0] += random.uniform(-self.hue_delta, self.hue_delta)
-                img[..., 0][img[..., 0] > 360] -= 360
-                img[..., 0][img[..., 0] < 0] += 360
-
-            # convert color from HSV to BGR
-            img = mmcv.hsv2bgr(img)
-
-            # random contrast
-            if mode == 0:
-                if random.randint(2):
-                    alpha = random.uniform(self.contrast_lower,
-                                        self.contrast_upper)
-                    img *= alpha
-
-            # randomly swap channels
-            if random.randint(2):
-                img = img[..., random.permutation(3)]
-            new_imgs.append(img)
-        results['img'] = new_imgs
+        if self.num_workers > 1 and len(imgs) > 1:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                results['img'] = list(pool.map(
+                    lambda args: self._distort_single(*args),
+                    zip(imgs, seeds)))
+        else:
+            results['img'] = [
+                self._distort_single(img, seed)
+                for img, seed in zip(imgs, seeds)
+            ]
         return results
 
     def __repr__(self):
@@ -287,7 +310,8 @@ class PhotoMetricDistortionMultiViewImage:
         repr_str += f'{(self.contrast_lower, self.contrast_upper)},\n'
         repr_str += 'saturation_range='
         repr_str += f'{(self.saturation_lower, self.saturation_upper)},\n'
-        repr_str += f'hue_delta={self.hue_delta})'
+        repr_str += f'hue_delta={self.hue_delta}, '
+        repr_str += f'num_workers={self.num_workers})'
         return repr_str
 
 
@@ -388,9 +412,14 @@ class RandomScaleImageMultiViewImage(object):
         scales
     """
 
-    def __init__(self, scales=[]):
+    def __init__(self, scales=[], num_workers=1):
         self.scales = scales
         assert len(self.scales)==1
+        self.num_workers = max(1, int(num_workers))
+
+    def _resize_single(self, args):
+        img, size = args
+        return mmcv.imresize(img, size, return_scale=False)
 
     def __call__(self, results):
         """Call function to pad images, masks, semantic segmentation maps.
@@ -407,8 +436,17 @@ class RandomScaleImageMultiViewImage(object):
         scale_factor = np.eye(4)
         scale_factor[0, 0] *= rand_scale
         scale_factor[1, 1] *= rand_scale
-        results['img'] = [mmcv.imresize(img, (x_size[idx], y_size[idx]), return_scale=False) for idx, img in
-                          enumerate(results['img'])]
+        target_sizes = [(x_size[idx], y_size[idx]) for idx in range(len(results['img']))]
+        imgs = results['img']
+        if self.num_workers > 1 and len(imgs) > 1:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                results['img'] = list(pool.map(
+                    self._resize_single, zip(imgs, target_sizes)))
+        else:
+            results['img'] = [
+                self._resize_single((img, target_sizes[idx]))
+                for idx, img in enumerate(imgs)
+            ]
         lidar2img = [scale_factor @ l2i for l2i in results['lidar2img']]
         results['lidar2img'] = lidar2img
         results['img_shape'] = [img.shape for img in results['img']]
@@ -419,7 +457,7 @@ class RandomScaleImageMultiViewImage(object):
 
     def __repr__(self):
         repr_str = self.__class__.__name__
-        repr_str += f'(size={self.scales}, '
+        repr_str += f'(size={self.scales}, num_workers={self.num_workers})'
         return repr_str
     
 
