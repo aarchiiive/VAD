@@ -254,7 +254,13 @@ class VADPerceptionTransformer(BaseModule):
             if self.rotate_prev_bev:
                 for i in range(bs):
                     # num_prev_bev = prev_bev.size(1)
-                    rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
+                    rotation_val = kwargs['img_metas'][i]['can_bus'][-1]
+                    if isinstance(rotation_val, (np.ndarray, list, tuple)):
+                        rotation_angle = float(np.array(rotation_val).reshape(-1)[0])
+                    elif torch.is_tensor(rotation_val):
+                        rotation_angle = float(rotation_val.item())
+                    else:
+                        rotation_angle = float(rotation_val)
                     tmp_prev_bev = prev_bev[:, i].reshape(
                         bev_h, bev_w, -1).permute(2, 0, 1)
                     tmp_prev_bev = rotate(tmp_prev_bev, rotation_angle,

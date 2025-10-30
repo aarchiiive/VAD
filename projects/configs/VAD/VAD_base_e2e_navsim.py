@@ -17,8 +17,8 @@ img_norm_cfg = dict(
    mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
 # For nuScenes we usually do 10-class detection
 class_names = [
-    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
-    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+    'vehicle', 'pedestrian', 'bicycle', 'traffic_cone',
+    'barrier', 'czone_sign', 'generic_object'
 ]
 num_classes = len(class_names)
 
@@ -43,6 +43,8 @@ _ffn_dim_ = _dim_*2
 _num_levels_ = 4
 bev_h_ = 200
 bev_w_ = 200
+
+num_cams = 8
 queue_length = 4 # each sequence contains `queue_length` frames.
 total_epochs = 60
 
@@ -79,7 +81,8 @@ model = dict(
         query_use_fix_pad=False,
         ego_his_encoder=None,
         ego_lcf_feat_idx=None,
-        valid_fut_ts=6,
+        valid_fut_ts=5,
+        fut_ts=5,
         ego_agent_decoder=dict(
             type='CustomTransformerDecoder',
             num_layers=1,
@@ -165,6 +168,7 @@ model = dict(
         map_code_weights=[1.0, 1.0, 1.0, 1.0],
         transformer=dict(
             type='VADPerceptionTransformer',
+            num_cams=num_cams,
             map_num_vec=map_num_vec,
             map_num_pts_per_vec=map_fixed_ptsnum_per_pred_line,
             rotate_prev_bev=True,
@@ -187,6 +191,7 @@ model = dict(
                         dict(
                             type='SpatialCrossAttention',
                             pc_range=point_cloud_range,
+                            num_cams=num_cams,
                             deformable_attention=dict(
                                 type='MSDeformableAttention3D',
                                 embed_dims=_dim_,
@@ -310,8 +315,9 @@ model = dict(
             pts_cost=dict(type='OrderedPtsL1Cost', weight=1.0),
             pc_range=point_cloud_range))))
 
-dataset_type = 'VADCustomNuScenesDataset'
-data_root = 'data/nuscenes/'
+dataset_type = 'VADCustomNavsimDataset'
+data_root = '/home/work/datasets/openscene-v1.1/'
+ann_root = '/home/work/song99/VAD/data/navsim_infos/'
 file_client_args = dict(backend='disk')
 
 train_pipeline = [
@@ -357,13 +363,13 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=4,
+    samples_per_gpu=1,
     workers_per_gpu=4,
     prefetch_factor=4,
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'vad_nuscenes_infos_temporal_train.pkl',
+        ann_file=ann_root + 'vad_navsim_infos_temporal_train_start0_count1.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -375,34 +381,37 @@ data = dict(
         map_classes=map_classes,
         map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
         map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
+        sensor_root='/home/work/datasets/openscene-v1.1/sensor_blobs/trainval',
         # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
         # and box_type_3d='Depth' in sunrgbd and scannet dataset.
         box_type_3d='LiDAR',
-        custom_eval_version='vad_nusc_detection_cvpr_2019'),
+        custom_eval_version='vad_navsim_detection'),
     val=dict(type=dataset_type,
              data_root=data_root,
              pc_range=point_cloud_range,
-             ann_file=data_root + 'vad_nuscenes_infos_temporal_val.pkl',
+             ann_file=ann_root + 'vad_navsim_infos_temporal_val_start0_count1.pkl',
              pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
              classes=class_names, modality=input_modality, samples_per_gpu=1,
              map_classes=map_classes,
-             map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+             map_ann_file=None,
              map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
              map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
-             use_pkl_result=True,
-             custom_eval_version='vad_nusc_detection_cvpr_2019'),
+              use_pkl_result=True,
+             custom_eval_version='vad_navsim_detection',
+             sensor_root='/home/work/datasets/openscene-v1.1/sensor_blobs/trainval'),
     test=dict(type=dataset_type,
               data_root=data_root,
               pc_range=point_cloud_range,
-              ann_file=data_root + 'vad_nuscenes_infos_temporal_val.pkl',
+              ann_file=ann_root + 'vad_navsim_infos_temporal_val_start0_count1.pkl',
               pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
               classes=class_names, modality=input_modality, samples_per_gpu=1,
               map_classes=map_classes,
-              map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+              map_ann_file=None,
               map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
               map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
               use_pkl_result=True,
-              custom_eval_version='vad_nusc_detection_cvpr_2019'),
+              custom_eval_version='vad_navsim_detection',
+              sensor_root='/home/work/datasets/openscene-v1.1/sensor_blobs/trainval'),
     shuffler_sampler=dict(type='DistributedGroupSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler')
 )
@@ -436,7 +445,7 @@ log_config = dict(
         dict(type='TensorboardLoggerHook'),
         dict(
             type='WandbLoggerHook',
-            init_kwargs=dict(project='VAD', name='VAD_base_e2e'))
+            init_kwargs=dict(project='VAD', name='VAD_base_e2e_navsim'))
     ])
 # fp16 = dict(loss_scale=512.)
 # find_unused_parameters = True

@@ -14,27 +14,28 @@ from mmdet.datasets import DATASETS
 import torch
 import numpy as np
 from nuscenes.eval.common.utils import quaternion_yaw, Quaternion
-from .vad_custom_nuscenes_eval import NuScenesEval_custom
-from nuscenes.eval.common.utils import center_distance
 from projects.mmdet3d_plugin.models.utils.visual import save_tensor
 from mmcv.parallel import DataContainer as DC
 import random
 from mmdet3d.core import LiDARInstance3DBoxes
+from nuscenes.eval.common.utils import center_distance
 from nuscenes.utils.data_classes import Box as NuScenesBox
 from projects.mmdet3d_plugin.core.bbox.structures.nuscenes_box import CustomNuscenesBox
 from shapely import affinity, ops
 from shapely.geometry import LineString, box, MultiPolygon, MultiLineString
 from mmdet.datasets.pipelines import to_tensor
-from nuscenes.map_expansion.map_api import NuScenesMap, NuScenesMapExplorer
 from nuscenes.eval.detection.constants import DETECTION_NAMES
+from nuplan.database.maps_db.gpkg_mapsdb import GPKGMapsDB
+from nuplan.database.maps_db.map_api import NuPlanMapWrapper
+from nuplan.database.maps_db.map_explorer import NuPlanMapExplorer
 
 
 class LiDARInstanceLines(object):
     """Line instance in LIDAR coordinates
 
     """
-    def __init__(self, 
-                 instance_line_list, 
+    def __init__(self,
+                 instance_line_list,
                  sample_dist=1,
                  num_samples=250,
                  padding=False,
@@ -283,18 +284,18 @@ class LiDARInstanceLines(object):
                 flip_sampled_points = np.flip(sampled_points, axis=0)
                 shift_pts_list.append(sampled_points)
                 shift_pts_list.append(flip_sampled_points)
-            
+
             multi_shifts_pts = np.stack(shift_pts_list,axis=0)
             shifts_num,_,_ = multi_shifts_pts.shape
 
             if shifts_num > final_shift_num:
                 index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
                 multi_shifts_pts = multi_shifts_pts[index]
-            
+
             multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
             multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(
                             dtype=torch.float32)
-            
+
             multi_shifts_pts_tensor[:,:,0] = torch.clamp(multi_shifts_pts_tensor[:,:,0], min=-self.max_x,max=self.max_x)
             multi_shifts_pts_tensor[:,:,1] = torch.clamp(multi_shifts_pts_tensor[:,:,1], min=-self.max_y,max=self.max_y)
             # if not is_poly:
@@ -350,7 +351,7 @@ class LiDARInstanceLines(object):
                 flip_sampled_points = np.flip(sampled_points, axis=0)
                 shift_pts_list.append(sampled_points)
                 shift_pts_list.append(flip_sampled_points)
-            
+
             multi_shifts_pts = np.stack(shift_pts_list,axis=0)
             shifts_num,_,_ = multi_shifts_pts.shape
             # import pdb;pdb.set_trace()
@@ -359,11 +360,11 @@ class LiDARInstanceLines(object):
                 flip0_shifts_pts = multi_shifts_pts[index]
                 flip1_shifts_pts = multi_shifts_pts[index+shift_num]
                 multi_shifts_pts = np.concatenate((flip0_shifts_pts,flip1_shifts_pts),axis=0)
-            
+
             multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
             multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(
                             dtype=torch.float32)
-            
+
             multi_shifts_pts_tensor[:,:,0] = torch.clamp(multi_shifts_pts_tensor[:,:,0], min=-self.max_x,max=self.max_x)
             multi_shifts_pts_tensor[:,:,1] = torch.clamp(multi_shifts_pts_tensor[:,:,1], min=-self.max_y,max=self.max_y)
             # if not is_poly:
@@ -476,17 +477,20 @@ class VectorizedLocalMap(object):
     CLASS2LABEL = {
         'road_divider': 0,
         'lane_divider': 0,
+        'boundaries': 0,
         'ped_crossing': 1,
+        'crosswalks': 1,
         'contours': 2,
-        'others': -1
+        'others': -1,
     }
+
     def __init__(self,
                  dataroot,
                  patch_size,
-                 map_classes=['divider','ped_crossing','boundary'],
-                 line_classes=['road_divider', 'lane_divider'],
-                 ped_crossing_classes=['ped_crossing'],
-                 contour_classes=['road_segment', 'lane'],
+                 map_classes=None,
+                 line_classes=None,
+                 ped_crossing_classes=None,
+                 contour_classes=None,
                  sample_dist=1,
                  num_samples=250,
                  padding=False,
@@ -498,17 +502,37 @@ class VectorizedLocalMap(object):
         '''
         super().__init__()
         self.data_root = dataroot
-        self.MAPS = ['boston-seaport', 'singapore-hollandvillage',
-                     'singapore-onenorth', 'singapore-queenstown']
-        self.vec_classes = map_classes
-        self.line_classes = line_classes
-        self.ped_crossing_classes = ped_crossing_classes
-        self.polygon_classes = contour_classes
-        self.nusc_maps = {}
-        self.map_explorer = {}
+
+        # Resolve map root (holds nuplan gpkg files)
+        potential_map_root = os.path.join(self.data_root, "maps")
+        if os.path.isdir(potential_map_root):
+            self.map_root = potential_map_root
+        else:
+            self.map_root = self.data_root
+        self.map_version = "nuplan-maps-v1.0"
+
+        # Default layer selections aligned with nuPlan maps
+        self.vec_classes = map_classes or ['divider', 'ped_crossing', 'boundary']
+        self.line_classes = line_classes or ['boundaries']
+        self.ped_crossing_classes = ped_crossing_classes or ['crosswalks']
+        self.polygon_classes = contour_classes or ['road_segments', 'lanes_polygons']
+
+        self.MAPS = [
+            'us-nv-las-vegas-strip',
+            'us-ma-boston',
+            'us-pa-pittsburgh-hazelwood',
+            'sg-one-north',
+        ]
+        self.map_apis: Dict[str, NuPlanMapWrapper] = {}
+        self.map_explorer: Dict[str, NuPlanMapExplorer] = {}
+        self.maps_db = GPKGMapsDB(map_root=self.map_root, map_version=self.map_version)
         for loc in self.MAPS:
-            self.nusc_maps[loc] = NuScenesMap(dataroot=self.data_root, map_name=loc)
-            self.map_explorer[loc] = NuScenesMapExplorer(self.nusc_maps[loc])
+            try:
+                map_api = NuPlanMapWrapper(self.maps_db, loc)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load map '{loc}' from root '{self.map_root}': {exc}") from exc
+            self.map_apis[loc] = map_api
+            self.map_explorer[loc] = NuPlanMapExplorer(map_api)
 
         self.patch_size = patch_size
         self.sample_dist = sample_dist
@@ -517,11 +541,21 @@ class VectorizedLocalMap(object):
         self.fixed_num = fixed_ptsnum_per_line
         self.padding_value = padding_value
 
+    def _get_map_api(self, location: str) -> NuPlanMapWrapper:
+        if location not in self.map_apis:
+            try:
+                map_api = NuPlanMapWrapper(self.maps_db, location)
+            except Exception as exc:
+                raise RuntimeError(f"Map '{location}' is not available in root '{self.map_root}': {exc}") from exc
+            self.map_apis[location] = map_api
+            self.map_explorer[location] = NuPlanMapExplorer(map_api)
+        return self.map_apis[location]
+
     def gen_vectorized_samples(self, location, lidar2global_translation, lidar2global_rotation):
         '''
         use lidar2global to get gt map layers
         '''
-        
+
         map_pose = lidar2global_translation[:2]
         rotation = Quaternion(lidar2global_rotation)
 
@@ -532,7 +566,7 @@ class VectorizedLocalMap(object):
         for vec_class in self.vec_classes:
             if vec_class == 'divider':
                 line_geom = self.get_map_geom(patch_box, patch_angle, self.line_classes, location)
-                line_instances_dict = self.line_geoms_to_instances(line_geom)     
+                line_instances_dict = self.line_geoms_to_instances(line_geom)
                 for line_type, instances in line_instances_dict.items():
                     for instance in instances:
                         vectors.append((instance, self.CLASS2LABEL.get(line_type, -1)))
@@ -542,7 +576,7 @@ class VectorizedLocalMap(object):
                 ped_instance_list = self.ped_poly_geoms_to_instances(ped_geom)
                 # import pdb;pdb.set_trace()
                 for instance in ped_instance_list:
-                    vectors.append((instance, self.CLASS2LABEL.get('ped_crossing', -1)))
+                    vectors.append((instance, self.CLASS2LABEL.get('crosswalks', -1)))
             elif vec_class == 'boundary':
                 polygon_geom = self.get_map_geom(patch_box, patch_angle, self.polygon_classes, location)
                 # import pdb;pdb.set_trace()
@@ -563,7 +597,7 @@ class VectorizedLocalMap(object):
             if type != -1:
                 gt_instance.append(instance)
                 gt_labels.append(type)
-        
+
         gt_instance = LiDARInstanceLines(gt_instance,self.sample_dist,
                         self.num_samples, self.padding, self.fixed_num,self.padding_value, patch_size=self.patch_size)
 
@@ -579,24 +613,19 @@ class VectorizedLocalMap(object):
         map_geom = []
         for layer_name in layer_names:
             if layer_name in self.line_classes:
-                # import pdb;pdb.set_trace()
                 geoms = self.get_divider_line(patch_box, patch_angle, layer_name, location)
-                # import pdb;pdb.set_trace()
-                # geoms = self.map_explorer[location]._get_layer_line(patch_box, patch_angle, layer_name)
                 map_geom.append((layer_name, geoms))
             elif layer_name in self.polygon_classes:
                 geoms = self.get_contour_line(patch_box, patch_angle, layer_name, location)
-                # geoms = self.map_explorer[location]._get_layer_polygon(patch_box, patch_angle, layer_name)
                 map_geom.append((layer_name, geoms))
             elif layer_name in self.ped_crossing_classes:
-                geoms = self.get_ped_crossing_line(patch_box, patch_angle, location)
-                # geoms = self.map_explorer[location]._get_layer_polygon(patch_box, patch_angle, layer_name)
+                geoms = self.get_ped_crossing_line(patch_box, patch_angle, layer_name, location)
                 map_geom.append((layer_name, geoms))
         return map_geom
 
     def _one_type_line_geom_to_vectors(self, line_geom):
         line_vectors = []
-        
+
         for line in line_geom:
             if not line.is_empty:
                 if line.geom_type == 'MultiLineString':
@@ -610,7 +639,7 @@ class VectorizedLocalMap(object):
 
     def _one_type_line_geom_to_instances(self, line_geom):
         line_instances = []
-        
+
         for line in line_geom:
             if not line.is_empty:
                 if line.geom_type == 'MultiLineString':
@@ -625,8 +654,8 @@ class VectorizedLocalMap(object):
     def poly_geoms_to_vectors(self, polygon_geom):
         roads = polygon_geom[0][1]
         lanes = polygon_geom[1][1]
-        union_roads = ops.unary_union(roads)
-        union_lanes = ops.unary_union(lanes)
+        union_roads = ops.unary_union(roads) if roads else MultiPolygon([])
+        union_lanes = ops.unary_union(lanes) if lanes else MultiPolygon([])
         union_segments = ops.unary_union([union_roads, union_lanes])
         max_x = self.patch_size[1] / 2
         max_y = self.patch_size[0] / 2
@@ -662,6 +691,8 @@ class VectorizedLocalMap(object):
     def ped_poly_geoms_to_instances(self, ped_geom):
         # import pdb;pdb.set_trace()
         ped = ped_geom[0][1]
+        if len(ped) == 0:
+            return []
         union_segments = ops.unary_union(ped)
         max_x = self.patch_size[1] / 2
         max_y = self.patch_size[0] / 2
@@ -699,6 +730,8 @@ class VectorizedLocalMap(object):
     def poly_geoms_to_instances(self, polygon_geom):
         roads = polygon_geom[0][1]
         lanes = polygon_geom[1][1]
+        if len(roads) == 0 and len(lanes) == 0:
+            return []
         union_roads = ops.unary_union(roads)
         union_lanes = ops.unary_union(lanes)
         union_segments = ops.unary_union([union_roads, union_lanes])
@@ -768,98 +801,73 @@ class VectorizedLocalMap(object):
 
         return self._one_type_line_geom_to_vectors(results)
 
-    def get_contour_line(self,patch_box,patch_angle,layer_name,location):
-        if layer_name not in self.map_explorer[location].map_api.non_geometric_polygon_layers:
-            raise ValueError('{} is not a polygonal layer'.format(layer_name))
-
+    def get_contour_line(self, patch_box, patch_angle, layer_name, location):
         patch_x = patch_box[0]
         patch_y = patch_box[1]
+        map_api = self._get_map_api(location)
 
-        patch = self.map_explorer[location].get_patch_coord(patch_box, patch_angle)
+        patch = map_api.get_patch_coord(patch_box, patch_angle)
 
-        records = getattr(self.map_explorer[location].map_api, layer_name)
+        records = map_api.load_vector_layer(layer_name)
 
         polygon_list = []
-        if layer_name == 'drivable_area':
-            for record in records:
-                polygons = [self.map_explorer[location].map_api.extract_polygon(polygon_token) for polygon_token in record['polygon_tokens']]
+        for geometry in records['geometry']:
+            if geometry is None or geometry.is_empty:
+                continue
 
-                for polygon in polygons:
-                    new_polygon = polygon.intersection(patch)
-                    if not new_polygon.is_empty:
-                        new_polygon = affinity.rotate(new_polygon, -patch_angle,
-                                                      origin=(patch_x, patch_y), use_radians=False)
-                        new_polygon = affinity.affine_transform(new_polygon,
-                                                                [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
-                        if new_polygon.geom_type == 'Polygon':
-                            new_polygon = MultiPolygon([new_polygon])
-                        polygon_list.append(new_polygon)
-
-        else:
-            for record in records:
-                polygon = self.map_explorer[location].map_api.extract_polygon(record['polygon_token'])
-
-                if polygon.is_valid:
-                    new_polygon = polygon.intersection(patch)
-                    if not new_polygon.is_empty:
-                        new_polygon = affinity.rotate(new_polygon, -patch_angle,
-                                                      origin=(patch_x, patch_y), use_radians=False)
-                        new_polygon = affinity.affine_transform(new_polygon,
-                                                                [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
-                        if new_polygon.geom_type == 'Polygon':
-                            new_polygon = MultiPolygon([new_polygon])
-                        polygon_list.append(new_polygon)
+            new_polygon = geometry.intersection(patch)
+            if new_polygon.is_empty:
+                continue
+            new_polygon = affinity.rotate(new_polygon, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
+            new_polygon = affinity.affine_transform(new_polygon, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+            if new_polygon.geom_type == 'Polygon':
+                new_polygon = MultiPolygon([new_polygon])
+            polygon_list.append(new_polygon)
 
         return polygon_list
 
-    def get_divider_line(self,patch_box,patch_angle,layer_name,location):
-        if layer_name not in self.map_explorer[location].map_api.non_geometric_line_layers:
-            raise ValueError("{} is not a line layer".format(layer_name))
-
-        if layer_name == 'traffic_light':
-            return None
-
+    def get_divider_line(self, patch_box, patch_angle, layer_name, location):
         patch_x = patch_box[0]
         patch_y = patch_box[1]
-
-        patch = self.map_explorer[location].get_patch_coord(patch_box, patch_angle)
+        map_api = self._get_map_api(location)
+        patch = map_api.get_patch_coord(patch_box, patch_angle)
 
         line_list = []
-        records = getattr(self.map_explorer[location].map_api, layer_name)
-        for record in records:
-            line = self.map_explorer[location].map_api.extract_line(record['line_token'])
-            if line.is_empty:  # Skip lines without nodes.
+        records = map_api.load_vector_layer(layer_name)
+        for geometry in records['geometry']:
+            if geometry is None or geometry.is_empty:
                 continue
-
-            new_line = line.intersection(patch)
-            if not new_line.is_empty:
-                new_line = affinity.rotate(new_line, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
-                new_line = affinity.affine_transform(new_line,
-                                                     [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+            new_line = geometry.intersection(patch)
+            if new_line.is_empty:
+                continue
+            new_line = affinity.rotate(new_line, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
+            new_line = affinity.affine_transform(new_line, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+            if new_line.geom_type == 'MultiLineString':
+                line_list.extend(list(new_line.geoms))
+            else:
                 line_list.append(new_line)
 
         return line_list
 
-    def get_ped_crossing_line(self, patch_box, patch_angle, location):
+    def get_ped_crossing_line(self, patch_box, patch_angle, layer_name, location):
         patch_x = patch_box[0]
         patch_y = patch_box[1]
+        map_api = self._get_map_api(location)
+        patch = map_api.get_patch_coord(patch_box, patch_angle)
 
-        patch = self.map_explorer[location].get_patch_coord(patch_box, patch_angle)
         polygon_list = []
-        records = getattr(self.map_explorer[location].map_api, 'ped_crossing')
-        # records = getattr(self.nusc_maps[location], 'ped_crossing')
-        for record in records:
-            polygon = self.map_explorer[location].map_api.extract_polygon(record['polygon_token'])
-            if polygon.is_valid:
-                new_polygon = polygon.intersection(patch)
-                if not new_polygon.is_empty:
-                    new_polygon = affinity.rotate(new_polygon, -patch_angle,
-                                                      origin=(patch_x, patch_y), use_radians=False)
-                    new_polygon = affinity.affine_transform(new_polygon,
-                                                            [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
-                    if new_polygon.geom_type == 'Polygon':
-                        new_polygon = MultiPolygon([new_polygon])
-                    polygon_list.append(new_polygon)
+        records = map_api.load_vector_layer(layer_name)
+        for geometry in records['geometry']:
+            if geometry is None or geometry.is_empty:
+                continue
+            new_polygon = geometry.intersection(patch)
+            if new_polygon.is_empty:
+                continue
+            new_polygon = affinity.rotate(new_polygon, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
+            new_polygon = affinity.affine_transform(new_polygon, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+            if new_polygon.geom_type == 'Polygon':
+                new_polygon = MultiPolygon([new_polygon])
+            polygon_list.append(new_polygon)
 
         return polygon_list
 
@@ -918,9 +926,11 @@ class v1CustomDetectionConfig:
                  min_recall: float,
                  min_precision: float,
                  max_boxes_per_sample: int,
-                 mean_ap_weight: int):
+                 mean_ap_weight: int,
+                 valid_class_names: List[str] = None):
 
-        assert set(class_range_x.keys()) == set(DETECTION_NAMES), "Class count mismatch."
+        expected_classes = valid_class_names if valid_class_names is not None else list(DETECTION_NAMES)
+        assert set(class_range_x.keys()) == set(expected_classes), "Class count mismatch."
         assert dist_th_tp in dist_ths, "dist_th_tp must be in set of dist_ths."
 
         self.class_range_x = class_range_x
@@ -932,6 +942,7 @@ class v1CustomDetectionConfig:
         self.min_precision = min_precision
         self.max_boxes_per_sample = max_boxes_per_sample
         self.mean_ap_weight = mean_ap_weight
+        self.valid_class_names = expected_classes
 
         self.class_names = self.class_range_y.keys()
 
@@ -956,7 +967,7 @@ class v1CustomDetectionConfig:
         }
 
     @classmethod
-    def deserialize(cls, content: dict):
+    def deserialize(cls, content: dict, valid_class_names: List[str] = None):
         """ Initialize from serialized dictionary. """
         return cls(content['class_range_x'],
                    content['class_range_y'],
@@ -966,7 +977,8 @@ class v1CustomDetectionConfig:
                    content['min_recall'],
                    content['min_precision'],
                    content['max_boxes_per_sample'],
-                   content['mean_ap_weight'])
+                   content['mean_ap_weight'],
+                   valid_class_names=valid_class_names)
 
     @property
     def dist_fcn_callable(self):
@@ -977,10 +989,19 @@ class v1CustomDetectionConfig:
             raise Exception('Error: Unknown distance function %s!' % self.dist_fcn)
 
 @DATASETS.register_module()
-class VADCustomNuScenesDataset(NuScenesDataset):
+class VADCustomNavsimDataset(NuScenesDataset):
     r"""Custom NuScenes Dataset.
     """
     MAPCLASSES = ('divider',)
+    CLASSES = (
+        'vehicle',
+        'pedestrian',
+        'bicycle',
+        'traffic_cone',
+        'barrier',
+        'czone_sign',
+        'generic_object',
+    )
     def __init__(
         self,
         queue_length=4,
@@ -993,11 +1014,12 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         map_ann_file=None,
         map_fixed_ptsnum_per_line=-1,
         map_eval_use_same_gt_sample_num_flag=False,
-        padding_value=-10000,
-        use_pkl_result=False,
-        custom_eval_version='vad_nusc_detection_cvpr_2019',
-        *args,
-        **kwargs
+                 padding_value=-10000,
+                 use_pkl_result=False,
+                 custom_eval_version='vad_navsim_detection',
+                 sensor_root=None,
+                 *args,
+                 **kwargs
     ):
         super().__init__(*args, **kwargs)
         self.queue_length = queue_length
@@ -1016,7 +1038,15 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         # Load config file and deserialize it.
         with open(cfg_path, 'r') as f:
             data = json.load(f)
-        self.custom_eval_detection_configs = v1CustomDetectionConfig.deserialize(data)
+        self.custom_eval_detection_configs = v1CustomDetectionConfig.deserialize(
+            data,
+            valid_class_names=list(self.CLASSES),
+        )
+
+        self.sensor_root = sensor_root
+        if self.sensor_root is None:
+            default_sensor_root = os.path.join(self.data_root, 'sensor_blobs')
+            self.sensor_root = default_sensor_root if os.path.isdir(default_sensor_root) else self.data_root
 
         self.map_ann_file = map_ann_file
         self.MAPCLASSES = self.get_map_classes(map_classes)
@@ -1028,10 +1058,13 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         self.padding_value = padding_value
         self.fixed_num = map_fixed_ptsnum_per_line
         self.eval_use_same_gt_sample_num_flag = map_eval_use_same_gt_sample_num_flag
-        self.vector_map = VectorizedLocalMap(kwargs['data_root'], 
-                            patch_size=self.patch_size, map_classes=self.MAPCLASSES, 
-                            fixed_ptsnum_per_line=map_fixed_ptsnum_per_line,
-                            padding_value=self.padding_value)
+        self.vector_map = VectorizedLocalMap(
+            kwargs['data_root'],
+            patch_size=self.patch_size,
+            map_classes=self.MAPCLASSES,
+            fixed_ptsnum_per_line=map_fixed_ptsnum_per_line,
+            padding_value=self.padding_value,
+        )
         self.is_vis_on_test = True
 
     @classmethod
@@ -1090,7 +1123,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         anns_results = self.vector_map.gen_vectorized_samples(
             location, lidar2global_translation, lidar2global_rotation
         )
-        
+
         '''
         anns_results, type: dict
             'gt_vecs_pts_loc': list[num_vecs], vec with num_points*2 coordinates
@@ -1105,7 +1138,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             try:
                 gt_vecs_pts_loc = gt_vecs_pts_loc.flatten(1).to(dtype=torch.float32)
             except:
-                # empty tensor, will be passed in train, 
+                # empty tensor, will be passed in train,
                 # but we preserve it for test
                 gt_vecs_pts_loc = gt_vecs_pts_loc
 
@@ -1228,7 +1261,8 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         else:
             mask = info['num_lidar_pts'] > 0
         gt_bboxes_3d = info['gt_boxes'][mask]
-        gt_names_3d = info['gt_names'][mask]
+        gt_names_all = np.array(info['gt_names'])
+        gt_names_3d = gt_names_all[mask]
         gt_labels_3d = []
         for cat in gt_names_3d:
             if cat in self.CLASSES:
@@ -1242,7 +1276,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             nan_mask = np.isnan(gt_velocity[:, 0])
             gt_velocity[nan_mask] = [0.0, 0.0]
             gt_bboxes_3d = np.concatenate([gt_bboxes_3d, gt_velocity], axis=-1)
-        
+
         if self.with_attr:
             gt_fut_trajs = info['gt_agent_fut_trajs'][mask]
             gt_fut_masks = info['gt_agent_fut_masks'][mask]
@@ -1259,7 +1293,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             gt_bboxes_3d,
             box_dim=gt_bboxes_3d.shape[-1],
             origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
-        
+
         anns_results = dict(
             gt_bboxes_3d=gt_bboxes_3d,
             gt_labels_3d=gt_labels_3d,
@@ -1289,10 +1323,23 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         """
         info = self.data_infos[index]
         # standard protocal modified from SECOND.Pytorch
+        lidar_path = info['lidar_path']
+        if self.sensor_root is not None:
+            lidar_path = os.path.join(self.sensor_root, lidar_path)
+
+        sweeps = []
+        for sweep in info['sweeps']:
+            sweep_copy = sweep.copy()
+            if sweep_copy.get('data_path'):
+                sweep_copy['data_path'] = os.path.join(self.sensor_root, sweep_copy['data_path']) if self.sensor_root is not None else sweep_copy['data_path']
+            sweeps.append(sweep_copy)
+
+        can_bus = np.asarray(info['can_bus'], dtype=np.float32)
+
         input_dict = dict(
             sample_idx=info['token'],
-            pts_filename=info['lidar_path'],
-            sweeps=info['sweeps'],
+            pts_filename=lidar_path,
+            sweeps=sweeps,
             ego2global_translation=info['ego2global_translation'],
             ego2global_rotation=info['ego2global_rotation'],
             lidar2ego_translation=info['lidar2ego_translation'],
@@ -1300,7 +1347,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             prev_idx=info['prev'],
             next_idx=info['next'],
             scene_token=info['scene_token'],
-            can_bus=info['can_bus'],
+            can_bus=can_bus,
             frame_idx=info['frame_idx'],
             timestamp=info['timestamp'] / 1e6,
             fut_valid_flag=info['fut_valid_flag'],
@@ -1325,7 +1372,10 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             input_dict["camera2ego"] = []
             input_dict["camera_intrinsics"] = []
             for cam_type, cam_info in info['cams'].items():
-                image_paths.append(cam_info['data_path'])
+                img_path = cam_info['data_path']
+                if self.sensor_root is not None:
+                    img_path = os.path.join(self.sensor_root, img_path)
+                image_paths.append(img_path)
                 # obtain lidar to image transformation matrix
                 lidar2cam_r = np.linalg.inv(cam_info['sensor2lidar_rotation'])
                 lidar2cam_t = cam_info[
@@ -1341,7 +1391,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
 
                 cam_intrinsics.append(viewpad)
                 lidar2cam_rts.append(lidar2cam_rt.T)
-            
+
                 # camera to ego transform
                 camera2ego = np.eye(4).astype(np.float32)
                 camera2ego[:3, :3] = Quaternion(
@@ -1634,103 +1684,75 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             dict: Dictionary of evaluation details.
         """
         detail = dict()
-        from nuscenes import NuScenes
-        self.nusc = NuScenes(version=self.version, dataroot=self.data_root,
-                             verbose=False)
 
-        output_dir = osp.join(*osp.split(result_path)[:-1])
+        from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import eval_map, format_res_gt_by_classes
 
-        eval_set_map = {
-            'v1.0-mini': 'mini_val',
-            'v1.0-trainval': 'val',
-        }
-        self.nusc_eval = NuScenesEval_custom(
-            self.nusc,
-            config=self.custom_eval_detection_configs,
-            result_path=result_path,
-            eval_set=eval_set_map[self.version],
-            output_dir=output_dir,
-            verbose=False,
-            overlap_test=self.overlap_test,
-            data_infos=self.data_infos
-        )
-        self.nusc_eval.main(plot_examples=0, render_curves=False)
-        # record metrics
-        metrics = mmcv.load(osp.join(output_dir, 'metrics_summary.json'))
-        metric_prefix = f'{result_name}_NuScenes'
-        for name in self.CLASSES:
-            for k, v in metrics['label_aps'][name].items():
-                val = float('{:.4f}'.format(v))
-                detail['{}/{}_AP_dist_{}'.format(metric_prefix, name, k)] = val
-            for k, v in metrics['label_tp_errors'][name].items():
-                val = float('{:.4f}'.format(v))
-                detail['{}/{}_{}'.format(metric_prefix, name, k)] = val
-            for k, v in metrics['tp_errors'].items():
-                val = float('{:.4f}'.format(v))
-                detail['{}/{}'.format(metric_prefix,
-                                      self.ErrNameMapping[k])] = val
-        detail['{}/NDS'.format(metric_prefix)] = metrics['nd_score']
-        detail['{}/mAP'.format(metric_prefix)] = metrics['mean_ap']
-
-
-        from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import eval_map
-        from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import format_res_gt_by_classes
         result_path = osp.abspath(result_path)
-        
-        print('Formating results & gts by classes')
         pred_results = mmcv.load(result_path)
-        map_results = pred_results['map_results']
-        gt_anns = mmcv.load(self.map_ann_file)
-        map_annotations = gt_anns['GTs']
-        cls_gens, cls_gts = format_res_gt_by_classes(result_path,
-                                                     map_results,
-                                                     map_annotations,
-                                                     cls_names=self.MAPCLASSES,
-                                                     num_pred_pts_per_instance=self.fixed_num,
-                                                     eval_use_same_gt_sample_num_flag=self.eval_use_same_gt_sample_num_flag,
-                                                     pc_range=self.pc_range)
+        map_results = pred_results.get('map_results', [])
+
         map_metrics = map_metric if isinstance(map_metric, list) else [map_metric]
         allowed_metrics = ['chamfer', 'iou']
         for metric in map_metrics:
             if metric not in allowed_metrics:
                 raise KeyError(f'metric {metric} is not supported')
-        for metric in map_metrics:
-            print('-*'*10+f'use metric:{metric}'+'-*'*10)
-            if metric == 'chamfer':
-                thresholds = [0.5,1.0,1.5]
-            elif metric == 'iou':
-                thresholds= np.linspace(.5, 0.95, int(np.round((0.95 - .5) / .05)) + 1, endpoint=True)
-            cls_aps = np.zeros((len(thresholds),self.NUM_MAPCLASSES))
-            for i, thr in enumerate(thresholds):
-                print('-*'*10+f'threshhold:{thr}'+'-*'*10)
-                mAP, cls_ap = eval_map(
-                                map_results,
-                                map_annotations,
-                                cls_gens,
-                                cls_gts,
-                                threshold=thr,
-                                cls_names=self.MAPCLASSES,
-                                logger=logger,
-                                num_pred_pts_per_instance=self.fixed_num,
-                                pc_range=self.pc_range,
-                                metric=metric)
-                for j in range(self.NUM_MAPCLASSES):
-                    cls_aps[i, j] = cls_ap[j]['ap']
-            for i, name in enumerate(self.MAPCLASSES):
-                print('{}: {}'.format(name, cls_aps.mean(0)[i]))
-                detail['NuscMap_{}/{}_AP'.format(metric,name)] =  cls_aps.mean(0)[i]
-            print('map: {}'.format(cls_aps.mean(0).mean()))
-            detail['NuscMap_{}/mAP'.format(metric)] = cls_aps.mean(0).mean()
-            for i, name in enumerate(self.MAPCLASSES):
-                for j, thr in enumerate(thresholds):
-                    if metric == 'chamfer':
-                        detail['NuscMap_{}/{}_AP_thr_{}'.format(metric,name,thr)]=cls_aps[j][i]
-                    elif metric == 'iou':
-                        if thr == 0.5 or thr == 0.75:
-                            detail['NuscMap_{}/{}_AP_thr_{}'.format(metric,name,thr)]=cls_aps[j][i]
+
+        if len(map_results) > 0 and self.map_ann_file is not None:
+            print('Formatting map results & ground truths by classes')
+            gt_anns = mmcv.load(self.map_ann_file)
+            map_annotations = gt_anns['GTs']
+            cls_gens, cls_gts = format_res_gt_by_classes(
+                result_path,
+                map_results,
+                map_annotations,
+                cls_names=self.MAPCLASSES,
+                num_pred_pts_per_instance=self.fixed_num,
+                eval_use_same_gt_sample_num_flag=self.eval_use_same_gt_sample_num_flag,
+                pc_range=self.pc_range,
+            )
+            for metric in map_metrics:
+                print('-*' * 10 + f'use metric:{metric}' + '-*' * 10)
+                if metric == 'chamfer':
+                    thresholds = [0.5, 1.0, 1.5]
+                elif metric == 'iou':
+                    thresholds = np.linspace(.5, 0.95, int(np.round((0.95 - .5) / .05)) + 1, endpoint=True)
+                cls_aps = np.zeros((len(thresholds), self.NUM_MAPCLASSES))
+                for i, thr in enumerate(thresholds):
+                    print('-*' * 10 + f'threshold:{thr}' + '-*' * 10)
+                    mAP, cls_ap = eval_map(
+                        map_results,
+                        map_annotations,
+                        cls_gens,
+                        cls_gts,
+                        threshold=thr,
+                        cls_names=self.MAPCLASSES,
+                        logger=logger,
+                        num_pred_pts_per_instance=self.fixed_num,
+                        pc_range=self.pc_range,
+                        metric=metric,
+                    )
+                    for j in range(self.NUM_MAPCLASSES):
+                        cls_aps[i, j] = cls_ap[j]['ap']
+                for i, name in enumerate(self.MAPCLASSES):
+                    print('{}: {}'.format(name, cls_aps.mean(0)[i]))
+                    detail['Map_{}/{}_AP'.format(metric, name)] = cls_aps.mean(0)[i]
+                print('map: {}'.format(cls_aps.mean(0).mean()))
+                detail['Map_{}/mAP'.format(metric)] = cls_aps.mean(0).mean()
+                for i, name in enumerate(self.MAPCLASSES):
+                    for j, thr in enumerate(thresholds):
+                        if metric == 'chamfer':
+                            detail['Map_{}/{}_AP_thr_{}'.format(metric, name, thr)] = cls_aps[j][i]
+                        elif metric == 'iou' and thr in (0.5, 0.75):
+                            detail['Map_{}/{}_AP_thr_{}'.format(metric, name, thr)] = cls_aps[j][i]
+        else:
+            print('No map results or map annotations provided; skipping map evaluation.')
+
+        detection_results = pred_results.get('pts_bbox', [])
+        if len(detection_results) > 0:
+            print('NavSim detection evaluation is currently not implemented; skipping detection metrics.')
 
         return detail
-    
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -1773,20 +1795,20 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         for met in result_metric_names:
             for cls in motion_cls_names:
                 result_dict[met+'_'+cls] = 0.0
-        
+
         alpha = 0.5
 
         for i in range(len(results)):
             for key in all_metric_dict.keys():
                 all_metric_dict[key] += results[i]['metric_results'][key]
-        
+
         for cls in motion_cls_names:
             result_dict['EPA_'+cls] = (all_metric_dict['hit_'+cls] - \
                  alpha * all_metric_dict['fp_'+cls]) / all_metric_dict['gt_'+cls]
             result_dict['ADE_'+cls] = all_metric_dict['ADE_'+cls] / all_metric_dict['cnt_ade_'+cls]
             result_dict['FDE_'+cls] = all_metric_dict['FDE_'+cls] / all_metric_dict['cnt_fde_'+cls]
             result_dict['MR_'+cls] = all_metric_dict['MR_'+cls] / all_metric_dict['cnt_fde_'+cls]
-        
+
         print('\n')
         print('-------------- Motion Prediction --------------')
         for k, v in result_dict.items():
@@ -1807,7 +1829,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             else:
                 for k in res['metric_results'].keys():
                     metric_dict[k] += res['metric_results'][k]
-        
+
         for k in metric_dict:
             metric_dict[k] = metric_dict[k] / num_valid
             print("{}:{}".format(k, metric_dict[k]))

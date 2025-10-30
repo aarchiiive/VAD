@@ -6,7 +6,7 @@ import numpy as np
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
-from mmdet.models import HEADS, build_loss 
+from mmdet.models import HEADS, build_loss
 from mmdet.models.dense_heads import DETRHead
 from mmcv.runner import force_fp32, auto_fp16
 from mmcv.utils import TORCH_VERSION, digit_version
@@ -240,7 +240,7 @@ class VADHead(DETRHead):
             if 'bg_cls_weight' in loss_map_cls:
                 loss_map_cls.pop('bg_cls_weight')
             self.map_bg_cls_weight = map_bg_cls_weight
-        
+
         self.traj_bg_cls_weight = 0
 
         super(VADHead, self).__init__(*args, transformer=transformer, **kwargs)
@@ -248,7 +248,7 @@ class VADHead(DETRHead):
             self.code_weights, requires_grad=False), requires_grad=False)
         self.map_code_weights = nn.Parameter(torch.tensor(
             self.map_code_weights, requires_grad=False), requires_grad=False)
-        
+
         if kwargs['train_cfg'] is not None:
             assert 'map_assigner' in kwargs['train_cfg'], 'map assigner should be provided '\
                 'when train_cfg is set.'
@@ -270,7 +270,7 @@ class VADHead(DETRHead):
             # DETR sampling=False, so use PseudoSampler
             sampler_cfg = dict(type='PseudoSampler')
             self.map_sampler = build_sampler(sampler_cfg, context=self)
-        
+
         self.loss_traj = build_loss(loss_traj)
         self.loss_traj_cls = build_loss(loss_traj_cls)
         self.loss_map_bbox = build_loss(loss_map_bbox)
@@ -383,10 +383,10 @@ class VADHead(DETRHead):
                 self.map_query_embedding = None
                 self.map_instance_embedding = nn.Embedding(self.map_num_vec, self.embed_dims * 2)
                 self.map_pts_embedding = nn.Embedding(self.map_num_pts_per_vec, self.embed_dims * 2)
-        
+
         if self.motion_decoder is not None:
             self.motion_decoder = build_transformer_layer_sequence(self.motion_decoder)
-            self.motion_mode_query = nn.Embedding(self.fut_mode, self.embed_dims)	
+            self.motion_mode_query = nn.Embedding(self.fut_mode, self.embed_dims)
             self.motion_mode_query.weight.requires_grad = True
             if self.use_pe:
                 self.pos_mlp_sa = nn.Linear(2, self.embed_dims)
@@ -398,11 +398,11 @@ class VADHead(DETRHead):
             self.motion_map_decoder = build_transformer_layer_sequence(self.motion_map_decoder)
             if self.use_pe:
                 self.pos_mlp = nn.Linear(2, self.embed_dims)
-        
+
         if self.ego_his_encoder is not None:
             self.ego_his_encoder = LaneNet(2, self.embed_dims//2, 3)
         else:
-            self.ego_query = nn.Embedding(1, self.embed_dims)	
+            self.ego_query = nn.Embedding(1, self.embed_dims)
 
         if self.ego_agent_decoder is not None:
             self.ego_agent_decoder = build_transformer_layer_sequence(self.ego_agent_decoder)
@@ -492,7 +492,7 @@ class VADHead(DETRHead):
                 network, each is a 5D-tensor with shape
                 (B, N, C, H, W).
             prev_bev: previous bev featues
-            only_bev: only compute BEV features with encoder. 
+            only_bev: only compute BEV features with encoder.
         Returns:
             all_cls_scores (Tensor): Outputs from the classification head, \
                 shape [nb_dec, bs, num_query, cls_out_channels]. Note \
@@ -501,11 +501,11 @@ class VADHead(DETRHead):
                 head with normalized coordinate format (cx, cy, w, l, cz, h, theta, vx, vy). \
                 Shape [nb_dec, bs, num_query, 9].
         """
-        
+
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
         object_query_embeds = self.query_embedding.weight.to(dtype)
-        
+
         if self.map_query_embed_type == 'all_pts':
             map_query_embeds = self.map_query_embedding.weight.to(dtype)
         elif self.map_query_embed_type == 'instance_pts':
@@ -518,7 +518,7 @@ class VADHead(DETRHead):
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),
                                device=bev_queries.device).to(dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
-            
+
         if only_bev:  # only use encoder to obtain BEV features, TODO: refine the workaround
             return self.transformer.get_bev_features(
                 mlvl_feats,
@@ -593,7 +593,7 @@ class VADHead(DETRHead):
             outputs_coord = tmp
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
-        
+
         for lvl in range(map_hs.shape[0]):
             if lvl == 0:
                 reference = map_init_reference
@@ -613,7 +613,7 @@ class VADHead(DETRHead):
             map_outputs_classes.append(map_outputs_class)
             map_outputs_coords.append(map_outputs_coord)
             map_outputs_pts_coords.append(map_outputs_pts_coord)
-            
+
         if self.motion_decoder is not None:
             batch_size, num_agent = outputs_coords_bev[-1].shape[:2]
             # motion_query
@@ -662,14 +662,14 @@ class VADHead(DETRHead):
 
                 # position encoding
                 if self.use_pe:
-                    (num_query, batch) = ca_motion_query.shape[:2] 
+                    (num_query, batch) = ca_motion_query.shape[:2]
                     motion_pos = torch.zeros((num_query, batch, 2), device=motion_hs.device)
                     motion_pos = self.pos_mlp(motion_pos)
                     map_pos = map_pos.permute(1, 0, 2)
                     map_pos = self.pos_mlp(map_pos)
                 else:
                     motion_pos, map_pos = None, None
-                
+
                 ca_motion_query = self.motion_map_decoder(
                     query=ca_motion_query,
                     key=map_query,
@@ -696,7 +696,7 @@ class VADHead(DETRHead):
         outputs_traj_class = self.traj_cls_branches[0](motion_hs)
         outputs_trajs_classes.append(outputs_traj_class.squeeze(-1))
         (batch, num_agent) = motion_hs.shape[:2]
-             
+
         map_outputs_classes = torch.stack(map_outputs_classes)
         map_outputs_coords = torch.stack(map_outputs_coords)
         map_outputs_pts_coords = torch.stack(map_outputs_pts_coords)
@@ -774,23 +774,23 @@ class VADHead(DETRHead):
                  ego_map_query.permute(1, 0, 2)],
                 dim=-1
             )  # [B, 1, 2D]
-        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is not None:                
+        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is not None:
             ego_feats = torch.cat(
                 [ego_agent_query.permute(1, 0, 2),
                  ego_map_query.permute(1, 0, 2),
                  ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]],
                 dim=-1
             )  # [B, 1, 2D+2]
-        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is None:                
+        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is None:
             ego_feats = torch.cat(
                 [ego_agent_query.permute(1, 0, 2),
                  ego_map_query.permute(1, 0, 2)],
                 dim=-1
-            )  # [B, 1, 2D]  
+            )  # [B, 1, 2D]
 
         # Ego prediction
         outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
-        outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0], 
+        outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0],
                                                       self.ego_fut_mode, self.fut_ts, 2)
 
         outs = {
@@ -1173,7 +1173,7 @@ class VADHead(DETRHead):
             loss_plan_bound = torch.nan_to_num(loss_plan_bound)
             loss_plan_col = torch.nan_to_num(loss_plan_col)
             loss_plan_dir = torch.nan_to_num(loss_plan_dir)
-        
+
         loss_plan_dict = dict()
         loss_plan_dict['loss_plan_reg'] = loss_plan_l1
         loss_plan_dict['loss_plan_bound'] = loss_plan_bound
@@ -1181,7 +1181,7 @@ class VADHead(DETRHead):
         loss_plan_dict['loss_plan_dir'] = loss_plan_dir
 
         return loss_plan_dict
-    
+
     def loss_single(self,
                     cls_scores,
                     bbox_preds,
@@ -1400,7 +1400,7 @@ class VADHead(DETRHead):
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          pts_targets_list, pts_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
- 
+
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
@@ -1453,7 +1453,7 @@ class VADHead(DETRHead):
 
         loss_pts = self.loss_map_pts(
             pts_preds[isnotnan,:,:],
-            normalized_pts_targets[isnotnan,:,:], 
+            normalized_pts_targets[isnotnan,:,:],
             pts_weights[isnotnan,:,:],
             avg_factor=num_total_pos)
 
@@ -1474,7 +1474,7 @@ class VADHead(DETRHead):
         loss_iou = self.loss_map_iou(
             bboxes[isnotnan, :4],
             bbox_targets[isnotnan, :4],
-            bbox_weights[isnotnan, :4], 
+            bbox_weights[isnotnan, :4],
             avg_factor=num_total_pos)
 
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
@@ -1565,7 +1565,7 @@ class VADHead(DETRHead):
             self.loss_single, all_cls_scores, all_bbox_preds, all_traj_preds,
             all_traj_cls_scores, all_gt_bboxes_list, all_gt_labels_list,
             all_gt_attr_labels_list, all_gt_bboxes_ignore_list)
-        
+
 
         num_dec_layers = len(map_all_cls_scores)
         device = map_gt_labels_list[0].device
@@ -1758,7 +1758,7 @@ class VADHead(DETRHead):
             selected_map_pos: [B*A, P1(+1), 2]
             selected_padding_mask: [B*A, P1(+1)]
         """
-        
+
         if dis_thresh is None:
             raise NotImplementedError('Not implement yet')
 

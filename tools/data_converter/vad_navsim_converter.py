@@ -4,7 +4,7 @@ import argparse
 import os
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import mmcv
 import numpy as np
@@ -26,7 +26,7 @@ from vad_target_builder import VADTargetBuilder
 
 
 def _build_sensor_config(num_history_frames: int) -> SensorConfig:
-    """Construct a sensor configuration that loads all history frames for every sensor."""
+    """Load camera metadata for each history frame while skipping LiDAR blobs."""
     history_indices = list(range(num_history_frames))
     return SensorConfig(
         cam_f0=history_indices,
@@ -118,15 +118,17 @@ def _build_camera_entries(
             )
 
         if sensor2lidar_rot is not None:
-            sensor2lidar_rot = _to_rotation_matrix(sensor2lidar_rot).tolist()
+            sensor2lidar_rot = _to_rotation_matrix(sensor2lidar_rot).astype(np.float32)
+        if sensor2lidar_trans is not None:
+            sensor2lidar_trans = np.asarray(sensor2lidar_trans, dtype=np.float32)
         if cam_intrinsic is not None:
-            cam_intrinsic = np.asarray(cam_intrinsic, dtype=np.float64).tolist()
+            cam_intrinsic = np.asarray(cam_intrinsic, dtype=np.float32)
 
         cams_info[key] = {
             "data_path": str(data_path),
             "cam_intrinsic": cam_intrinsic,
             "sensor2lidar_rotation": sensor2lidar_rot,
-            "sensor2lidar_translation": cam_data.get("sensor2lidar_translation"),
+            "sensor2lidar_translation": sensor2lidar_trans,
             "sensor2ego_rotation": sensor2ego_rot,
             "sensor2ego_translation": sensor2ego_trans,
         }
@@ -303,10 +305,12 @@ def create_navsim_infos(
     max_sweeps: int,
     fut_horizon: float,
     interval: float,
+    mode: str,
+    frame_interval: Optional[int],
     train_start: int = 0,
-    train_count: int | None = None,
+    train_count: Optional[int] = None,
     val_start: int = 0,
-    val_count: int | None = None,
+    val_count: Optional[int] = None,
 ) -> None:
     """Main routine producing train/val info files for NavSim VAD."""
     GlobalHydra.instance().clear()
@@ -321,6 +325,15 @@ def create_navsim_infos(
 
     train_filter = _prepare_scene_filter(instantiate(cfg.train_test_split.scene_filter), cfg.train_logs)
     val_filter = _prepare_scene_filter(instantiate(cfg.train_test_split.scene_filter), cfg.val_logs)
+
+    if frame_interval is not None:
+        if frame_interval <= 0:
+            raise ValueError("frame_interval must be positive.")
+        train_filter.frame_interval = frame_interval
+        val_filter.frame_interval = frame_interval
+    elif mode == "openscene":
+        train_filter.frame_interval = 1
+        val_filter.frame_interval = 1
 
     sensor_config = _build_sensor_config(train_filter.num_history_frames)
 
@@ -339,27 +352,62 @@ def create_navsim_infos(
     trajectory_sampling = TrajectorySampling(time_horizon=fut_horizon, interval_length=interval)
     target_builder = VADTargetBuilder(trajectory_sampling=trajectory_sampling, config=config)
 
-    def _select_tokens(tokens: List[str], start: int, count: int | None) -> List[str]:
+    def _select_tokens(
+        loader: SceneLoader,
+        start: int,
+        count: Optional[int],
+    ) -> Tuple[List[str], List[str]]:
         if start < 0:
             raise ValueError("start index must be non-negative.")
+
+        if mode == "openscene":
+            tokens_per_log = loader.get_tokens_list_per_log()
+            log_names = sorted(tokens_per_log.keys())
+            if start >= len(log_names):
+                return [], []
+            selected_logs = log_names[start:]
+            if count is not None:
+                selected_logs = selected_logs[: max(count, 0)]
+            selected_tokens: List[str] = []
+            for log_name in selected_logs:
+                selected_tokens.extend(tokens_per_log[log_name])
+            return selected_tokens, selected_logs
+
+        tokens = loader.tokens
         if start >= len(tokens):
-            return []
+            return [], []
         subset = tokens[start:]
         if count is not None:
             subset = subset[: max(count, 0)]
-        return subset
+        return subset, []
 
-    train_tokens = _select_tokens(train_loader.tokens, train_start, train_count)
-    val_tokens = _select_tokens(val_loader.tokens, val_start, val_count)
+    train_tokens, train_logs = _select_tokens(train_loader, train_start, train_count)
+    val_tokens, val_logs = _select_tokens(val_loader, val_start, val_count)
 
     train_infos = _generate_infos(train_loader, train_tokens, target_builder, max_sweeps)
     val_infos = _generate_infos(val_loader, val_tokens, target_builder, max_sweeps)
 
+    effective_interval = train_filter.frame_interval
+
     metadata = {
         "version": split,
+        "mode": mode,
+        "frame_interval": effective_interval,
         "subset": {
-            "train": {"start": train_start, "requested_count": train_count, "actual_count": len(train_infos)},
-            "val": {"start": val_start, "requested_count": val_count, "actual_count": len(val_infos)},
+            "train": {
+                "start": train_start,
+                "requested_count": train_count,
+                "actual_token_count": len(train_infos),
+                "actual_log_count": len(train_logs) if train_logs else None,
+                "log_names": train_logs if train_logs else None,
+            },
+            "val": {
+                "start": val_start,
+                "requested_count": val_count,
+                "actual_token_count": len(val_infos),
+                "actual_log_count": len(val_logs) if val_logs else None,
+                "log_names": val_logs if val_logs else None,
+            },
         },
     }
 
@@ -368,10 +416,18 @@ def create_navsim_infos(
     train_data = {"infos": train_infos, "metadata": metadata}
     val_data = {"infos": val_infos, "metadata": metadata}
 
-    def _build_filename(prefix: str, default_name: str, subset_start: int, subset_count: int | None, actual: int) -> Path:
+    def _build_filename(
+        prefix: str,
+        default_name: str,
+        subset_start: int,
+        subset_count: Optional[int],
+        actual_tokens: int,
+        actual_logs: Optional[int],
+    ) -> Path:
         subset_applied = subset_start > 0 or subset_count is not None
         if subset_applied:
-            return output_dir / f"{prefix}_start{subset_start}_count{actual}.pkl"
+            count_value = actual_logs if (actual_logs is not None) else actual_tokens
+            return output_dir / f"{prefix}_start{subset_start}_count{count_value}.pkl"
         return output_dir / default_name
 
     train_path = _build_filename(
@@ -379,21 +435,25 @@ def create_navsim_infos(
         default_name="vad_navsim_infos_temporal_train.pkl",
         subset_start=train_start,
         subset_count=train_count,
-        actual=len(train_infos),
+        actual_tokens=len(train_infos),
+        actual_logs=len(train_logs) if train_logs else None,
     )
     val_path = _build_filename(
         prefix="vad_navsim_infos_temporal_val",
         default_name="vad_navsim_infos_temporal_val.pkl",
         subset_start=val_start,
         subset_count=val_count,
-        actual=len(val_infos),
+        actual_tokens=len(val_infos),
+        actual_logs=len(val_logs) if val_logs else None,
     )
 
     mmcv.dump(train_data, str(train_path))
     mmcv.dump(val_data, str(val_path))
 
-    print(f"Saved {len(train_infos)} training samples to {train_path}")
-    print(f"Saved {len(val_infos)} validation samples to {val_path}")
+    train_log_msg = f" ({len(train_logs)} logs)" if train_logs else ""
+    val_log_msg = f" ({len(val_logs)} logs)" if val_logs else ""
+    print(f"Saved {len(train_infos)} training samples{train_log_msg} to {train_path}")
+    print(f"Saved {len(val_infos)} validation samples{val_log_msg} to {val_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -414,6 +474,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Sampling interval between consecutive frames in seconds.",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="navsim",
+        choices=["navsim", "openscene"],
+        help="Generation mode. 'openscene' enables sliding-window sampling over entire logs.",
+    )
+    parser.add_argument(
+        "--frame-interval",
+        type=int,
+        default=None,
+        help="Custom frame interval for sliding window (overrides default in selected mode).",
     )
     parser.add_argument("--train-start", type=int, default=0, help="Start index within the training tokens.")
     parser.add_argument(
@@ -450,6 +523,8 @@ def main() -> None:
         max_sweeps=args.max_sweeps,
         fut_horizon=args.fut_horizon,
         interval=args.interval,
+        mode=args.mode,
+        frame_interval=args.frame_interval,
         train_start=args.train_start,
         train_count=args.train_count,
         val_start=args.val_start,
