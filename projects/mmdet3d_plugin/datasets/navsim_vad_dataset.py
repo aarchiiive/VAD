@@ -478,9 +478,13 @@ class VectorizedLocalMap(object):
         'road_divider': 0,
         'lane_divider': 0,
         'boundaries': 0,
+        'BOUNDARIES': 0,
         'ped_crossing': 1,
         'crosswalks': 1,
+        'CROSSWALK': 1,
         'contours': 2,
+        'lanes_polygons': 2,
+        'LANE': 2,
         'others': -1,
     }
 
@@ -512,10 +516,17 @@ class VectorizedLocalMap(object):
         self.map_version = "nuplan-maps-v1.0"
 
         # Default layer selections aligned with nuPlan maps
-        self.vec_classes = map_classes or ['divider', 'ped_crossing', 'boundary']
-        self.line_classes = line_classes or ['boundaries']
-        self.ped_crossing_classes = ped_crossing_classes or ['crosswalks']
-        self.polygon_classes = contour_classes or ['road_segments', 'lanes_polygons']
+        default_vec_classes = ['divider', 'ped_crossing', 'boundary']
+        self.vec_classes = [str(cls) for cls in (map_classes if map_classes is not None else default_vec_classes)]
+        self.line_classes = list(line_classes) if line_classes is not None else ['boundaries']
+        if 'boundaries' not in self.line_classes:
+            self.line_classes.append('boundaries')
+        self.ped_crossing_classes = list(ped_crossing_classes) if ped_crossing_classes is not None else ['crosswalks']
+        if 'crosswalks' not in self.ped_crossing_classes:
+            self.ped_crossing_classes.append('crosswalks')
+        self.polygon_classes = list(contour_classes) if contour_classes is not None else ['road_segments', 'lanes_polygons']
+        if 'lanes_polygons' not in self.polygon_classes:
+            self.polygon_classes.append('lanes_polygons')
 
         self.MAPS = [
             'us-nv-las-vegas-strip',
@@ -541,6 +552,40 @@ class VectorizedLocalMap(object):
         self.fixed_num = fixed_ptsnum_per_line
         self.padding_value = padding_value
 
+        # Map dataset-level class names to underlying nuPlan layers and aggregation logic.
+        self.class_aliases = {
+            'divider': {
+                'type': 'line',
+                'layers': self.line_classes,
+                'use_layer_name': True,
+            },
+            'ped_crossing': {
+                'type': 'ped_crossing',
+                'layers': self.ped_crossing_classes,
+                'label_key': 'ped_crossing',
+            },
+            'boundary': {
+                'type': 'polygon',
+                'layers': self.polygon_classes,
+                'label_key': 'contours',
+            },
+            'BOUNDARIES': {
+                'type': 'line',
+                'layers': ['boundaries'],
+                'label_key': 'BOUNDARIES',
+            },
+            'CROSSWALK': {
+                'type': 'ped_crossing',
+                'layers': ['crosswalks'],
+                'label_key': 'CROSSWALK',
+            },
+            'LANE': {
+                'type': 'polygon',
+                'layers': ['lanes_polygons'],
+                'label_key': 'LANE',
+            },
+        }
+
     def _get_map_api(self, location: str) -> NuPlanMapWrapper:
         if location not in self.map_apis:
             try:
@@ -564,28 +609,35 @@ class VectorizedLocalMap(object):
         # import pdb;pdb.set_trace()
         vectors = []
         for vec_class in self.vec_classes:
-            if vec_class == 'divider':
-                line_geom = self.get_map_geom(patch_box, patch_angle, self.line_classes, location)
-                line_instances_dict = self.line_geoms_to_instances(line_geom)
+            alias_key = vec_class if vec_class in self.class_aliases else str(vec_class).upper()
+            alias = self.class_aliases.get(alias_key)
+            if alias is None:
+                raise ValueError(f'Unsupported map class: {vec_class}')
+
+            map_geom = self.get_map_geom(patch_box, patch_angle, alias['layers'], location)
+            class_type = alias['type']
+
+            if class_type == 'line':
+                line_instances_dict = self.line_geoms_to_instances(map_geom)
                 for line_type, instances in line_instances_dict.items():
+                    label_key = line_type if alias.get('use_layer_name', False) else alias.get('label_key', line_type)
+                    label = self.CLASS2LABEL.get(label_key, -1)
                     for instance in instances:
-                        vectors.append((instance, self.CLASS2LABEL.get(line_type, -1)))
-            elif vec_class == 'ped_crossing':
-                ped_geom = self.get_map_geom(patch_box, patch_angle, self.ped_crossing_classes, location)
-                # ped_vector_list = self.ped_geoms_to_vectors(ped_geom)
-                ped_instance_list = self.ped_poly_geoms_to_instances(ped_geom)
-                # import pdb;pdb.set_trace()
+                        vectors.append((instance, label))
+            elif class_type == 'ped_crossing':
+                ped_instance_list = self.ped_poly_geoms_to_instances(map_geom)
+                label_key = alias.get('label_key', vec_class)
+                label = self.CLASS2LABEL.get(label_key, -1)
                 for instance in ped_instance_list:
-                    vectors.append((instance, self.CLASS2LABEL.get('crosswalks', -1)))
-            elif vec_class == 'boundary':
-                polygon_geom = self.get_map_geom(patch_box, patch_angle, self.polygon_classes, location)
-                # import pdb;pdb.set_trace()
-                poly_bound_list = self.poly_geoms_to_instances(polygon_geom)
-                # import pdb;pdb.set_trace()
+                    vectors.append((instance, label))
+            elif class_type == 'polygon':
+                poly_bound_list = self.poly_geoms_to_instances(map_geom)
+                label_key = alias.get('label_key', vec_class)
+                label = self.CLASS2LABEL.get(label_key, -1)
                 for contour in poly_bound_list:
-                    vectors.append((contour, self.CLASS2LABEL.get('contours', -1)))
+                    vectors.append((contour, label))
             else:
-                raise ValueError(f'WRONG vec_class: {vec_class}')
+                raise ValueError(f'Unsupported map class type: {class_type}')
 
         # filter out -1
         filtered_vectors = []
@@ -652,11 +704,17 @@ class VectorizedLocalMap(object):
         return line_instances
 
     def poly_geoms_to_vectors(self, polygon_geom):
-        roads = polygon_geom[0][1]
-        lanes = polygon_geom[1][1]
-        union_roads = ops.unary_union(roads) if roads else MultiPolygon([])
-        union_lanes = ops.unary_union(lanes) if lanes else MultiPolygon([])
-        union_segments = ops.unary_union([union_roads, union_lanes])
+        layer_map = {layer_name: geoms for layer_name, geoms in polygon_geom}
+        polygons = []
+        for geoms in layer_map.values():
+            polygons.extend([geom for geom in geoms if geom is not None and not geom.is_empty])
+        if not polygons:
+            return []
+
+        union_segments = ops.unary_union(polygons)
+        if union_segments.is_empty:
+            return []
+
         max_x = self.patch_size[1] / 2
         max_y = self.patch_size[0] / 2
         local_patch = box(-max_x + 0.2, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
@@ -728,13 +786,17 @@ class VectorizedLocalMap(object):
 
 
     def poly_geoms_to_instances(self, polygon_geom):
-        roads = polygon_geom[0][1]
-        lanes = polygon_geom[1][1]
-        if len(roads) == 0 and len(lanes) == 0:
+        layer_map = {layer_name: geoms for layer_name, geoms in polygon_geom}
+        polygons = []
+        for geoms in layer_map.values():
+            polygons.extend([geom for geom in geoms if geom is not None and not geom.is_empty])
+        if not polygons:
             return []
-        union_roads = ops.unary_union(roads)
-        union_lanes = ops.unary_union(lanes)
-        union_segments = ops.unary_union([union_roads, union_lanes])
+
+        union_segments = ops.unary_union(polygons)
+        if union_segments.is_empty:
+            return []
+
         max_x = self.patch_size[1] / 2
         max_y = self.patch_size[0] / 2
         local_patch = box(-max_x + 0.2, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
@@ -992,7 +1054,7 @@ class v1CustomDetectionConfig:
 class VADCustomNavsimDataset(NuScenesDataset):
     r"""Custom NuScenes Dataset.
     """
-    MAPCLASSES = ('divider',)
+    MAPCLASSES = ('BOUNDARIES', 'CROSSWALK', 'LANE')
     CLASSES = (
         'vehicle',
         'pedestrian',
