@@ -103,9 +103,11 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         else:
             mask_results = None
 
-    if mask_results is None:
-        return {'bbox_results': bbox_results}
-    return {'bbox_results': bbox_results, 'mask_results': mask_results}
+    if mask_results is not None:
+        for res, mask in zip(bbox_results, mask_results):
+            res['mask_results'] = mask
+
+    return bbox_results
 
 
 def collect_results_cpu(result_part, size, tmpdir=None):

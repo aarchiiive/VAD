@@ -12,6 +12,17 @@ import similaritymeasures
 #         pred, pred_mask, tgt, tgt_mask)()
 
 
+def _iter_tree_candidates(tree, query_geom, geometries, index_by_id):
+    for candidate in tree.query(query_geom):
+        if isinstance(candidate, np.integer):
+            idx = int(candidate)
+            geom = geometries[idx]
+        else:
+            geom = candidate
+            idx = index_by_id[id(geom)]
+        yield idx, geom
+
+
 def vec_iou(pred_lines, gt_lines):
     '''
         each line with 1 meter width
@@ -38,10 +49,8 @@ def vec_iou(pred_lines, gt_lines):
     iou_matrix = np.zeros((num_preds, num_gts))
 
     for i, pline in enumerate(pred_lines_shapely):
-
-        for o in tree.query(pline):
+        for gt_id, o in _iter_tree_candidates(tree, pline, gt_lines_shapely, index_by_id):
             if o.intersects(pline):
-                gt_id = index_by_id[id(o)]
 
                 inter = o.intersection(pline).area
                 union = o.union(pline).area
@@ -72,10 +81,8 @@ def convex_iou(pred_lines, gt_lines, gt_mask):
     iou_matrix = np.zeros((num_preds, num_gts))
 
     for i, pline in enumerate(gt_lines_shapely):
-
-        for o in tree.query(pline):
+        for pred_id, o in _iter_tree_candidates(tree, pline, pred_lines_shapely, index_by_id):
             if o.intersects(pline):
-                pred_id = index_by_id[id(o)]
 
                 inter = o.intersection(pline).area
                 union = o.union(pline).area
@@ -106,10 +113,8 @@ def rbbox_iou(pred_lines, gt_lines, gt_mask):
     iou_matrix = np.zeros((num_preds, num_gts))
 
     for i, pline in enumerate(gt_lines_shapely):
-
-        for o in tree.query(pline):
+        for pred_id, o in _iter_tree_candidates(tree, pline, pred_lines_shapely, index_by_id):
             if o.intersects(pline):
-                pred_id = index_by_id[id(o)]
 
                 inter = o.intersection(pline).area
                 union = o.union(pline).area
@@ -155,10 +160,8 @@ def polyline_score(pred_lines, gt_lines, linewidth=1., metric='POR'):
         iou_matrix = np.full((num_preds, num_gts), -100.)
 
     for i, pline in enumerate(gt_lines_shapely):
-
-        for o in tree.query(pline):
+        for pred_id, o in _iter_tree_candidates(tree, pline, pred_lines_shapely, index_by_id):
             if o.intersects(pline):
-                pred_id = index_by_id[id(o)]
 
                 if metric=='POR':
                     dist_mat = distance.cdist(
@@ -252,10 +255,8 @@ def custom_polyline_score(pred_lines, gt_lines, linewidth=1., metric='chamfer'):
         raise NotImplementedError
 
     for i, pline in enumerate(gt_lines_shapely):
-
-        for o in tree.query(pline):
+        for pred_id, o in _iter_tree_candidates(tree, pline, pred_lines_shapely, index_by_id):
             if o.intersects(pline):
-                pred_id = index_by_id[id(o)]
 
                 if metric=='chamfer':
                     dist_mat = distance.cdist(

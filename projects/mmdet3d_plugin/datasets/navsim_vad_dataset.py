@@ -1006,7 +1006,8 @@ class v1CustomDetectionConfig:
         self.mean_ap_weight = mean_ap_weight
         self.valid_class_names = expected_classes
 
-        self.class_names = self.class_range_y.keys()
+        # make a list copy so multiprocessing can pickle this configuration
+        self.class_names = list(self.class_range_y.keys())
 
     def __eq__(self, other):
         eq = True
@@ -1055,6 +1056,7 @@ class VADCustomNavsimDataset(NuScenesDataset):
     r"""Custom NuScenes Dataset.
     """
     MAPCLASSES = ('BOUNDARIES', 'CROSSWALK', 'LANE')
+    MOTION_CLASSES = ('vehicle', 'pedestrian')
     CLASSES = (
         'vehicle',
         'pedestrian',
@@ -1064,6 +1066,15 @@ class VADCustomNavsimDataset(NuScenesDataset):
         'czone_sign',
         'generic_object',
     )
+    DEFAULT_ATTRIBUTE_FALLBACK = {
+        'vehicle': 'vehicle.moving',
+        'pedestrian': 'pedestrian.moving',
+        'bicycle': 'cycle.with_rider',
+        'traffic_cone': '',
+        'barrier': '',
+        'czone_sign': '',
+        'generic_object': '',
+    }
     def __init__(
         self,
         queue_length=4,
@@ -1385,8 +1396,8 @@ class VADCustomNavsimDataset(NuScenesDataset):
         """
         info = self.data_infos[index]
         # standard protocal modified from SECOND.Pytorch
-        lidar_path = info['lidar_path']
-        if self.sensor_root is not None:
+        lidar_path = info.get('lidar_path', '')
+        if lidar_path and self.sensor_root is not None:
             lidar_path = os.path.join(self.sensor_root, lidar_path)
 
         sweeps = []
@@ -1595,6 +1606,9 @@ class VADCustomNavsimDataset(NuScenesDataset):
                 if box.score < score_thresh:
                     continue
                 name = det_mapped_class_names[box.label]
+                base_attr = NuScenesDataset.DefaultAttribute.get(name, '') or self.DEFAULT_ATTRIBUTE_FALLBACK.get(name, '')
+                if not base_attr:
+                    base_attr = 'vehicle.moving'
                 if np.sqrt(box.velocity[0]**2 + box.velocity[1]**2) > 0.2:
                     if name in [
                             'car',
@@ -1607,14 +1621,14 @@ class VADCustomNavsimDataset(NuScenesDataset):
                     elif name in ['bicycle', 'motorcycle']:
                         attr = 'cycle.with_rider'
                     else:
-                        attr = NuScenesDataset.DefaultAttribute[name]
+                        attr = base_attr
                 else:
                     if name in ['pedestrian']:
                         attr = 'pedestrian.standing'
                     elif name in ['bus']:
                         attr = 'vehicle.stopped'
                     else:
-                        attr = NuScenesDataset.DefaultAttribute[name]
+                        attr = base_attr
 
                 nusc_anno = dict(
                     sample_token=sample_token,
@@ -1845,35 +1859,47 @@ class VADCustomNavsimDataset(NuScenesDataset):
         Returns:
             dict[str, float]: Results of each evaluation metric.
         """
+        if isinstance(results, dict):
+            if 'bbox_results' in results:
+                results = results['bbox_results']
+            elif 'pts_bbox' in results:
+                results = results['pts_bbox']
+            else:
+                raise TypeError(f"Unsupported results dict keys: {results.keys()}")
+
         result_metric_names = ['EPA', 'ADE', 'FDE', 'MR']
-        motion_cls_names = ['car', 'pedestrian']
-        motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
-                               'fp', 'ADE', 'FDE', 'MR']
-        all_metric_dict = {}
+        motion_cls_names = list(self.MOTION_CLASSES)
+        motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit', 'fp', 'ADE', 'FDE', 'MR']
+        all_metric_dict: Dict[str, float] = {}
         for met in motion_metric_names:
             for cls in motion_cls_names:
-                all_metric_dict[met+'_'+cls] = 0.0
-        result_dict = {}
-        for met in result_metric_names:
-            for cls in motion_cls_names:
-                result_dict[met+'_'+cls] = 0.0
+                all_metric_dict[f'{met}_{cls}'] = 0.0
+        motion_results: Dict[str, float] = {f'{met}_{cls}': 0.0 for met in result_metric_names for cls in motion_cls_names}
 
         alpha = 0.5
 
         for i in range(len(results)):
+            metric_results = results[i].get('metric_results', {})
             for key in all_metric_dict.keys():
-                all_metric_dict[key] += results[i]['metric_results'][key]
+                all_metric_dict[key] += float(metric_results.get(key, 0.0))
 
         for cls in motion_cls_names:
-            result_dict['EPA_'+cls] = (all_metric_dict['hit_'+cls] - \
-                 alpha * all_metric_dict['fp_'+cls]) / all_metric_dict['gt_'+cls]
-            result_dict['ADE_'+cls] = all_metric_dict['ADE_'+cls] / all_metric_dict['cnt_ade_'+cls]
-            result_dict['FDE_'+cls] = all_metric_dict['FDE_'+cls] / all_metric_dict['cnt_fde_'+cls]
-            result_dict['MR_'+cls] = all_metric_dict['MR_'+cls] / all_metric_dict['cnt_fde_'+cls]
+            gt_cnt_raw = all_metric_dict[f'gt_{cls}']
+            ade_cnt = max(all_metric_dict[f'cnt_ade_{cls}'], 1e-6)
+            fde_cnt = max(all_metric_dict[f'cnt_fde_{cls}'], 1e-6)
+            motion_results[f'ADE_{cls}'] = all_metric_dict[f'ADE_{cls}'] / ade_cnt
+            motion_results[f'FDE_{cls}'] = all_metric_dict[f'FDE_{cls}'] / fde_cnt
+            motion_results[f'MR_{cls}'] = all_metric_dict[f'MR_{cls}'] / fde_cnt
+            if gt_cnt_raw > 0:
+                motion_results[f'EPA_{cls}'] = (
+                    all_metric_dict[f'hit_{cls}'] - alpha * all_metric_dict[f'fp_{cls}']
+                ) / gt_cnt_raw
+            else:
+                motion_results[f'EPA_{cls}'] = 0.0
 
         print('\n')
         print('-------------- Motion Prediction --------------')
-        for k, v in result_dict.items():
+        for k, v in motion_results.items():
             print(f'{k}: {v}')
 
         # NOTE: print planning metric
@@ -1881,31 +1907,46 @@ class VADCustomNavsimDataset(NuScenesDataset):
         print('-------------- Planning --------------')
         metric_dict = None
         num_valid = 0
+        planner_keys = [
+            'plan_L2_1s', 'plan_L2_2s', 'plan_L2_3s',
+            'plan_obj_col_1s', 'plan_obj_col_2s', 'plan_obj_col_3s',
+            'plan_obj_box_col_1s', 'plan_obj_box_col_2s', 'plan_obj_box_col_3s',
+            'fut_valid_flag',
+        ]
         for res in results:
-            if res['metric_results']['fut_valid_flag']:
+            metric_results = res.get('metric_results', {})
+            fut_flag = bool(metric_results.get('fut_valid_flag', False))
+            if fut_flag:
                 num_valid += 1
-            else:
-                continue
-            if metric_dict is None:
-                metric_dict = copy.deepcopy(res['metric_results'])
-            else:
-                for k in res['metric_results'].keys():
-                    metric_dict[k] += res['metric_results'][k]
+                if metric_dict is None:
+                    metric_dict = {k: float(metric_results.get(k, 0.0)) for k in planner_keys}
+                else:
+                    for k in planner_keys:
+                        metric_dict[k] += float(metric_results.get(k, 0.0))
 
-        for k in metric_dict:
-            metric_dict[k] = metric_dict[k] / num_valid
-            print("{}:{}".format(k, metric_dict[k]))
+        planning_results: Dict[str, float] = {}
+        if metric_dict is not None and num_valid > 0:
+            for k in metric_dict:
+                metric_dict[k] = metric_dict[k] / num_valid
+                planning_results[k] = metric_dict[k]
+                print("{}:{}".format(k, metric_dict[k]))
+        else:
+            print("No valid planning metrics found (fut_valid_flag was False for all samples).")
 
         result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
 
+        results_dict: Dict[str, float] = {}
+        results_dict.update(motion_results)
+        results_dict.update(planning_results)
+
         if isinstance(result_files, dict):
-            results_dict = dict()
             for name in result_names:
                 print('Evaluating bboxes of {}'.format(name))
                 ret_dict = self._evaluate_single(result_files[name], metric=metric, map_metric=map_metric)
-            results_dict.update(ret_dict)
+                results_dict.update(ret_dict)
         elif isinstance(result_files, str):
-            results_dict = self._evaluate_single(result_files, metric=metric, map_metric=map_metric)
+            ret_dict = self._evaluate_single(result_files, metric=metric, map_metric=map_metric)
+            results_dict.update(ret_dict)
 
         if tmp_dir is not None:
             tmp_dir.cleanup()

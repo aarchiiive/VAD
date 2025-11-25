@@ -327,8 +327,8 @@ class VADPerceptionTransformer(BaseModule):
                 reg_branches=None,
                 cls_branches=None,
                 map_reg_branches=None,
-                map_cls_branches=None,                
-                prev_bev=None,            
+                map_cls_branches=None,
+                prev_bev=None,
                 **kwargs):
         """Forward function for `Detr3DTransformer`.
         Args:
@@ -392,7 +392,7 @@ class VADPerceptionTransformer(BaseModule):
         map_query = map_query.unsqueeze(0).expand(bs, -1, -1)
         map_reference_points = self.map_reference_points(map_query_pos)
         map_reference_points = map_reference_points.sigmoid()
-        map_init_reference_out = map_reference_points        
+        map_init_reference_out = map_reference_points
 
         query = query.permute(1, 0, 2)
         query_pos = query_pos.permute(1, 0, 2)

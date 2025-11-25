@@ -243,52 +243,80 @@ def main():
         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
                                         args.gpu_collect)
 
-    tmp = {}
-    tmp['bbox_results'] = outputs
-    outputs = tmp
+    # Normalize to unified dict structure for downstream logic.
+    if outputs is not None:
+        if isinstance(outputs, dict):
+            bbox_results = outputs.get('bbox_results', outputs)
+            mask_results = outputs.get('mask_results', None)
+        else:
+            bbox_results = outputs
+            mask_results = None
+
+        if not isinstance(bbox_results, list):
+            raise TypeError(
+                f'Expected bbox_results to be list, but got {type(bbox_results)}')
+
+        outputs = {'bbox_results': bbox_results}
+        if mask_results is not None:
+            outputs['mask_results'] = mask_results
     rank, _ = get_dist_info()
     if rank == 0:
-        if args.out:
-            print(f'\nwriting results to {args.out}')
-            # assert False
-            if isinstance(outputs, list):
-                mmcv.dump(outputs, args.out)
-            else:
-                mmcv.dump(outputs['bbox_results'], args.out)
+        cfg_name = args.config.split('/')[-1].split('.')[0]
+        timestamp = time.ctime().replace(' ', '_').replace(':', '_')
+        default_prefix = osp.join('test', cfg_name, timestamp)
+
         kwargs = {} if args.eval_options is None else args.eval_options
-        kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
-            '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
-        if args.format_only:
-            dataset.format_results(outputs['bbox_results'], **kwargs)
+        kwargs['jsonfile_prefix'] = default_prefix
+        result_files, tmp_dir = dataset.format_results(outputs['bbox_results'], **kwargs)
+        if tmp_dir is not None:
+            tmp_dir.cleanup()
+        if isinstance(result_files, dict):
+            formatted_results = result_files
+        else:
+            formatted_results = {'pts_bbox': result_files}
 
-        if args.eval:
-            eval_kwargs = cfg.get('evaluation', {}).copy()
-            # hard-code way to remove EvalHook args
-            for key in [
-                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                    'rule'
-            ]:
-                eval_kwargs.pop(key, None)
-            eval_kwargs.update(dict(metric=args.eval, **kwargs))
+        eval_metrics = args.eval if args.eval else ['bbox']
+        eval_kwargs = cfg.get('evaluation', {}).copy()
+        for key in [
+                'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
+                'rule'
+        ]:
+            eval_kwargs.pop(key, None)
+        eval_kwargs.update(dict(metric=eval_metrics, **kwargs))
 
-            print(dataset.evaluate(outputs['bbox_results'], **eval_kwargs))
-    
+        evaluation_results = dataset.evaluate(outputs['bbox_results'], **eval_kwargs)
+        summary_paths = getattr(dataset, 'latest_summary_paths', [])
+
+        bundle = dict(
+            bbox_results=outputs['bbox_results'],
+            formatted_results=formatted_results,
+            evaluation_metrics=evaluation_results,
+            summary_paths=summary_paths,
+            jsonfile_prefix=default_prefix,
+        )
+
+        bundle_path = args.out if args.out else osp.join(default_prefix, 'bbox_results.pkl')
+        mmcv.mkdir_or_exist(osp.dirname(bundle_path))
+        print(f'\nSaving bundled results to {bundle_path}')
+        mmcv.dump(bundle, bundle_path)
+
         # # # NOTE: record to json
         # json_path = args.json_dir
         # if not os.path.exists(json_path):
         #     os.makedirs(json_path)
-        
+
         # metric_all = []
         # for res in outputs['bbox_results']:
         #     for k in res['metric_results'].keys():
         #         if type(res['metric_results'][k]) is np.ndarray:
         #             res['metric_results'][k] = res['metric_results'][k].tolist()
         #     metric_all.append(res['metric_results'])
-        
+
         # print('start saving to json done')
         # with open(json_path+'/metric_record.json', "w", encoding="utf-8") as f2:
         #     json.dump(metric_all, f2, indent=4)
         # print('save to json done')
 
 if __name__ == '__main__':
+    torch.multiprocessing.set_start_method('fork')
     main()

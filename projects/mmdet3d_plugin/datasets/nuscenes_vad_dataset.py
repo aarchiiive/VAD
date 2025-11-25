@@ -2,6 +2,7 @@ import os
 import json
 import copy
 import tempfile
+import csv
 from typing import Dict, List
 
 import numpy as np
@@ -28,13 +29,37 @@ from mmdet.datasets.pipelines import to_tensor
 from nuscenes.map_expansion.map_api import NuScenesMap, NuScenesMapExplorer
 from nuscenes.eval.detection.constants import DETECTION_NAMES
 
+try:
+    from prettytable import PrettyTable
+except ImportError:
+    PrettyTable = None
+
+
+def format_distance_label(value):
+    if float(value).is_integer():
+        return f'{int(value)}m'
+    text = f'{value}'
+    if text.endswith('0'):
+        text = text.rstrip('0').rstrip('.')
+    return f'{text}m'
+
+
+def _write_csv(path, fieldnames, rows):
+    if not rows:
+        return False
+    with open(path, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return True
+
 
 class LiDARInstanceLines(object):
     """Line instance in LIDAR coordinates
 
     """
-    def __init__(self, 
-                 instance_line_list, 
+    def __init__(self,
+                 instance_line_list,
                  sample_dist=1,
                  num_samples=250,
                  padding=False,
@@ -283,18 +308,18 @@ class LiDARInstanceLines(object):
                 flip_sampled_points = np.flip(sampled_points, axis=0)
                 shift_pts_list.append(sampled_points)
                 shift_pts_list.append(flip_sampled_points)
-            
+
             multi_shifts_pts = np.stack(shift_pts_list,axis=0)
             shifts_num,_,_ = multi_shifts_pts.shape
 
             if shifts_num > final_shift_num:
                 index = np.random.choice(multi_shifts_pts.shape[0], final_shift_num, replace=False)
                 multi_shifts_pts = multi_shifts_pts[index]
-            
+
             multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
             multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(
                             dtype=torch.float32)
-            
+
             multi_shifts_pts_tensor[:,:,0] = torch.clamp(multi_shifts_pts_tensor[:,:,0], min=-self.max_x,max=self.max_x)
             multi_shifts_pts_tensor[:,:,1] = torch.clamp(multi_shifts_pts_tensor[:,:,1], min=-self.max_y,max=self.max_y)
             # if not is_poly:
@@ -350,7 +375,7 @@ class LiDARInstanceLines(object):
                 flip_sampled_points = np.flip(sampled_points, axis=0)
                 shift_pts_list.append(sampled_points)
                 shift_pts_list.append(flip_sampled_points)
-            
+
             multi_shifts_pts = np.stack(shift_pts_list,axis=0)
             shifts_num,_,_ = multi_shifts_pts.shape
             # import pdb;pdb.set_trace()
@@ -359,11 +384,11 @@ class LiDARInstanceLines(object):
                 flip0_shifts_pts = multi_shifts_pts[index]
                 flip1_shifts_pts = multi_shifts_pts[index+shift_num]
                 multi_shifts_pts = np.concatenate((flip0_shifts_pts,flip1_shifts_pts),axis=0)
-            
+
             multi_shifts_pts_tensor = to_tensor(multi_shifts_pts)
             multi_shifts_pts_tensor = multi_shifts_pts_tensor.to(
                             dtype=torch.float32)
-            
+
             multi_shifts_pts_tensor[:,:,0] = torch.clamp(multi_shifts_pts_tensor[:,:,0], min=-self.max_x,max=self.max_x)
             multi_shifts_pts_tensor[:,:,1] = torch.clamp(multi_shifts_pts_tensor[:,:,1], min=-self.max_y,max=self.max_y)
             # if not is_poly:
@@ -521,7 +546,7 @@ class VectorizedLocalMap(object):
         '''
         use lidar2global to get gt map layers
         '''
-        
+
         map_pose = lidar2global_translation[:2]
         rotation = Quaternion(lidar2global_rotation)
 
@@ -532,7 +557,7 @@ class VectorizedLocalMap(object):
         for vec_class in self.vec_classes:
             if vec_class == 'divider':
                 line_geom = self.get_map_geom(patch_box, patch_angle, self.line_classes, location)
-                line_instances_dict = self.line_geoms_to_instances(line_geom)     
+                line_instances_dict = self.line_geoms_to_instances(line_geom)
                 for line_type, instances in line_instances_dict.items():
                     for instance in instances:
                         vectors.append((instance, self.CLASS2LABEL.get(line_type, -1)))
@@ -563,7 +588,7 @@ class VectorizedLocalMap(object):
             if type != -1:
                 gt_instance.append(instance)
                 gt_labels.append(type)
-        
+
         gt_instance = LiDARInstanceLines(gt_instance,self.sample_dist,
                         self.num_samples, self.padding, self.fixed_num,self.padding_value, patch_size=self.patch_size)
 
@@ -596,7 +621,7 @@ class VectorizedLocalMap(object):
 
     def _one_type_line_geom_to_vectors(self, line_geom):
         line_vectors = []
-        
+
         for line in line_geom:
             if not line.is_empty:
                 if line.geom_type == 'MultiLineString':
@@ -610,7 +635,7 @@ class VectorizedLocalMap(object):
 
     def _one_type_line_geom_to_instances(self, line_geom):
         line_instances = []
-        
+
         for line in line_geom:
             if not line.is_empty:
                 if line.geom_type == 'MultiLineString':
@@ -933,7 +958,9 @@ class v1CustomDetectionConfig:
         self.max_boxes_per_sample = max_boxes_per_sample
         self.mean_ap_weight = mean_ap_weight
 
-        self.class_names = self.class_range_y.keys()
+        # store a concrete list to avoid keeping dict_keys views, which
+        # cannot be pickled when dataloaders spawn worker processes
+        self.class_names = list(self.class_range_y.keys())
 
     def __eq__(self, other):
         eq = True
@@ -1006,6 +1033,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         self.with_attr = with_attr
         self.fut_ts = fut_ts
         self.use_pkl_result = use_pkl_result
+        self.distance_thresholds = [1.0, 1.5, 2.0]
 
         self.custom_eval_version = custom_eval_version
         # Check if config exists.
@@ -1033,6 +1061,43 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                             fixed_ptsnum_per_line=map_fixed_ptsnum_per_line,
                             padding_value=self.padding_value)
         self.is_vis_on_test = True
+
+    def _print_detection_summary(self, detection_results):
+        prefix = 'pts_bbox_NuScenes'
+        summary_keys = ['NDS', 'mAP', 'mATE', 'mASE', 'mAOE', 'mAVE', 'mAAE']
+        summary_table = PrettyTable()
+        summary_table.field_names = ['Summary Metric', 'Value']
+        for key in summary_keys:
+            metric_key = f'{prefix}/{key}'
+            if metric_key in detection_results:
+                summary_table.add_row([key, f'{detection_results[metric_key]:.6f}'])
+        if summary_table._rows:
+            print('\nSUMMARY METRICS:')
+            print(summary_table)
+
+        dist_headers = set()
+        class_rows = {}
+        for k, v in detection_results.items():
+            if not k.startswith(f'{prefix}/'):
+                continue
+            inner = k[len(prefix) + 1:]
+            if '_AP_dist_' in inner:
+                cls_name, dist = inner.split('_AP_dist_')
+                dist_headers.add(dist)
+                class_rows.setdefault(cls_name, {})[dist] = v
+        if class_rows:
+            dists = sorted(dist_headers, key=lambda x: float(x))
+            ap_table = PrettyTable()
+            columns = ['Class'] + [f'{d}m' for d in dists]
+            ap_table.field_names = columns
+            for cls in sorted(class_rows.keys()):
+                row = [cls]
+                for dist in dists:
+                    row.append(f'{class_rows[cls].get(dist, float("nan")):.6f}'
+                               if dist in class_rows[cls] else '-')
+                ap_table.add_row(row)
+            print('\nAVERAGE PRECISION (by Distance):')
+            print(ap_table)
 
     @classmethod
     def get_map_classes(cls, map_classes=None):
@@ -1090,7 +1155,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         anns_results = self.vector_map.gen_vectorized_samples(
             location, lidar2global_translation, lidar2global_rotation
         )
-        
+
         '''
         anns_results, type: dict
             'gt_vecs_pts_loc': list[num_vecs], vec with num_points*2 coordinates
@@ -1105,7 +1170,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             try:
                 gt_vecs_pts_loc = gt_vecs_pts_loc.flatten(1).to(dtype=torch.float32)
             except:
-                # empty tensor, will be passed in train, 
+                # empty tensor, will be passed in train,
                 # but we preserve it for test
                 gt_vecs_pts_loc = gt_vecs_pts_loc
 
@@ -1242,7 +1307,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             nan_mask = np.isnan(gt_velocity[:, 0])
             gt_velocity[nan_mask] = [0.0, 0.0]
             gt_bboxes_3d = np.concatenate([gt_bboxes_3d, gt_velocity], axis=-1)
-        
+
         if self.with_attr:
             gt_fut_trajs = info['gt_agent_fut_trajs'][mask]
             gt_fut_masks = info['gt_agent_fut_masks'][mask]
@@ -1259,7 +1324,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             gt_bboxes_3d,
             box_dim=gt_bboxes_3d.shape[-1],
             origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
-        
+
         anns_results = dict(
             gt_bboxes_3d=gt_bboxes_3d,
             gt_labels_3d=gt_labels_3d,
@@ -1341,7 +1406,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
 
                 cam_intrinsics.append(viewpad)
                 lidar2cam_rts.append(lidar2cam_rt.T)
-            
+
                 # camera to ego transform
                 camera2ego = np.eye(4).astype(np.float32)
                 camera2ego[:3, :3] = Quaternion(
@@ -1593,6 +1658,12 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         else:
             tmp_dir = None
 
+        existing_prefix = osp.join(jsonfile_prefix, 'pts_bbox')
+        existing_file = osp.join(existing_prefix, 'results_nusc.pkl')
+        if osp.exists(existing_file):
+            print(f'Found preformatted results at {existing_file}, skipping conversion.')
+            return {'pts_bbox': existing_file}, tmp_dir
+
         # currently the output prediction results could be in two formats
         # 1. list of dict('boxes_3d': ..., 'scores_3d': ..., 'labels_3d': ...)
         # 2. list of dict('pts_bbox' or 'img_bbox':
@@ -1676,7 +1747,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import eval_map
         from projects.mmdet3d_plugin.datasets.map_utils.mean_ap import format_res_gt_by_classes
         result_path = osp.abspath(result_path)
-        
+
         print('Formating results & gts by classes')
         pred_results = mmcv.load(result_path)
         map_results = pred_results['map_results']
@@ -1695,14 +1766,16 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             if metric not in allowed_metrics:
                 raise KeyError(f'metric {metric} is not supported')
         for metric in map_metrics:
-            print('-*'*10+f'use metric:{metric}'+'-*'*10)
+            print('\n' + '=' * 70)
+            print(f'Map Metric Summary ({metric})'.center(70))
+            print('=' * 70)
             if metric == 'chamfer':
                 thresholds = [0.5,1.0,1.5]
             elif metric == 'iou':
                 thresholds= np.linspace(.5, 0.95, int(np.round((0.95 - .5) / .05)) + 1, endpoint=True)
             cls_aps = np.zeros((len(thresholds),self.NUM_MAPCLASSES))
             for i, thr in enumerate(thresholds):
-                print('-*'*10+f'threshhold:{thr}'+'-*'*10)
+                print('\n' + f' Threshold {thr} '.center(50, '-'))
                 mAP, cls_ap = eval_map(
                                 map_results,
                                 map_annotations,
@@ -1716,11 +1789,17 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                                 metric=metric)
                 for j in range(self.NUM_MAPCLASSES):
                     cls_aps[i, j] = cls_ap[j]['ap']
+            class_means = cls_aps.mean(0)
+            class_table = PrettyTable()
+            class_table.field_names = ['Class', 'AP']
             for i, name in enumerate(self.MAPCLASSES):
-                print('{}: {}'.format(name, cls_aps.mean(0)[i]))
-                detail['NuscMap_{}/{}_AP'.format(metric,name)] =  cls_aps.mean(0)[i]
-            print('map: {}'.format(cls_aps.mean(0).mean()))
-            detail['NuscMap_{}/mAP'.format(metric)] = cls_aps.mean(0).mean()
+                avg_ap = class_means[i]
+                class_table.add_row([name, f'{avg_ap:.4f}'])
+                detail['NuscMap_{}/{}_AP'.format(metric, name)] = avg_ap
+            overall_map = class_means.mean()
+            print(class_table)
+            print(f'mAP: {overall_map:.4f}')
+            detail['NuscMap_{}/mAP'.format(metric)] = overall_map
             for i, name in enumerate(self.MAPCLASSES):
                 for j, thr in enumerate(thresholds):
                     if metric == 'chamfer':
@@ -1730,7 +1809,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                             detail['NuscMap_{}/{}_AP_thr_{}'.format(metric,name,thr)]=cls_aps[j][i]
 
         return detail
-    
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -1761,40 +1840,152 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         Returns:
             dict[str, float]: Results of each evaluation metric.
         """
-        result_metric_names = ['EPA', 'ADE', 'FDE', 'MR']
+        summary_root = jsonfile_prefix if jsonfile_prefix is not None else osp.join('test', 'eval_summaries')
+        summary_dir = osp.join(summary_root, 'summaries')
+        mmcv.mkdir_or_exist(summary_dir)
+        summary_paths = []
+        log_messages = []
+
+        result_metric_names = ['EPA', 'MR']
         motion_cls_names = ['car', 'pedestrian']
-        motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
-                               'fp', 'ADE', 'FDE', 'MR']
+        distance_thresholds = getattr(self, 'distance_thresholds', [1.0, 1.5, 2.0])
+
+        motion_summary_rows = []
+        motion_threshold_rows = []
+        planning_rows = []
+        map_class_rows = []
+        map_threshold_rows = []
+        map_overview_rows = []
+
+        # Initialize dictionaries for aggregating metrics
         all_metric_dict = {}
-        for met in motion_metric_names:
+
+        # Basic metrics without thresholds
+        for met in ['gt', 'hit', 'fp', 'MR']:
             for cls in motion_cls_names:
                 all_metric_dict[met+'_'+cls] = 0.0
-        result_dict = {}
-        for met in result_metric_names:
+
+        # ADE/FDE metrics for each distance threshold
+        for thresh in distance_thresholds:
+            thresh_label = format_distance_label(thresh)
             for cls in motion_cls_names:
-                result_dict[met+'_'+cls] = 0.0
-        
+                all_metric_dict[f'cnt_ade_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'cnt_fde_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'ADE_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'FDE_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'gt_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'fp_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'hit_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'MR_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'gt_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'fp_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'hit_{thresh_label}_{cls}'] = 0.0
+                all_metric_dict[f'MR_{thresh_label}_{cls}'] = 0.0
+
+        result_dict = {}
+
         alpha = 0.5
 
+        # Aggregate metrics from all results
         for i in range(len(results)):
             for key in all_metric_dict.keys():
-                all_metric_dict[key] += results[i]['metric_results'][key]
-        
+                if key in results[i]['metric_results']:
+                    all_metric_dict[key] += results[i]['metric_results'][key]
+
+        # Compute final metrics
         for cls in motion_cls_names:
+            # EPA and MR remain the same
             result_dict['EPA_'+cls] = (all_metric_dict['hit_'+cls] - \
                  alpha * all_metric_dict['fp_'+cls]) / all_metric_dict['gt_'+cls]
-            result_dict['ADE_'+cls] = all_metric_dict['ADE_'+cls] / all_metric_dict['cnt_ade_'+cls]
-            result_dict['FDE_'+cls] = all_metric_dict['FDE_'+cls] / all_metric_dict['cnt_fde_'+cls]
-            result_dict['MR_'+cls] = all_metric_dict['MR_'+cls] / all_metric_dict['cnt_fde_'+cls]
-        
-        print('\n')
-        print('-------------- Motion Prediction --------------')
-        for k, v in result_dict.items():
-            print(f'{k}: {v}')
+            result_dict['MR_'+cls] = all_metric_dict['MR_'+cls] / all_metric_dict['gt_'+cls]
+
+            # Compute ADE and FDE for each distance threshold
+            for thresh in distance_thresholds:
+                thresh_label = format_distance_label(thresh)
+                cnt_ade_key = f'cnt_ade_{thresh_label}_{cls}'
+                cnt_fde_key = f'cnt_fde_{thresh_label}_{cls}'
+
+                if all_metric_dict[cnt_ade_key] > 0:
+                    result_dict[f'ADE_{thresh_label}_{cls}'] = \
+                        all_metric_dict[f'ADE_{thresh_label}_{cls}'] / all_metric_dict[cnt_ade_key]
+                else:
+                    result_dict[f'ADE_{thresh_label}_{cls}'] = 0.0
+
+                if all_metric_dict[cnt_fde_key] > 0:
+                    result_dict[f'FDE_{thresh_label}_{cls}'] = \
+                        all_metric_dict[f'FDE_{thresh_label}_{cls}'] / all_metric_dict[cnt_fde_key]
+                else:
+                    result_dict[f'FDE_{thresh_label}_{cls}'] = 0.0
+
+        header_width = 50
+        motion_header = ' Motion Prediction '.center(header_width, '-')
+        log_messages.append(f'\n{motion_header}')
+        for metric in ['EPA', 'MR']:
+            row = {'Metric': metric}
+            for cls in motion_cls_names:
+                row[cls] = result_dict[f'{metric}_{cls}']
+            motion_summary_rows.append(row)
+
+        if PrettyTable:
+            summary_table = PrettyTable()
+            summary_table.field_names = ['Metric'] + motion_cls_names
+            for row in motion_summary_rows:
+                summary_table.add_row([row['Metric']] + [f'{row[cls]:.4f}' for cls in motion_cls_names])
+            log_messages.append(summary_table.get_string())
+        else:
+            log_messages.append('EPA and MR:')
+            for row in motion_summary_rows:
+                metric = row['Metric']
+                for cls in motion_cls_names:
+                    log_messages.append(f'  {metric}_{cls}: {row[cls]:.4f}')
+
+        log_messages.append('\nADE/FDE/EPA/MR by distance threshold:')
+        for thresh in distance_thresholds:
+            thresh_label = format_distance_label(thresh)
+            banner = f' Threshold {thresh_label} '.center(50, '-')
+            log_messages.append(f'\n{banner}')
+            log_messages.append('Class-wise metrics:')
+            thresh_rows = []
+            for cls in motion_cls_names:
+                ade_val = result_dict[f'ADE_{thresh_label}_{cls}']
+                fde_val = result_dict[f'FDE_{thresh_label}_{cls}']
+                hit_val = all_metric_dict[f'hit_{thresh_label}_{cls}']
+                fp_val = all_metric_dict[f'fp_{thresh_label}_{cls}']
+                gt_val = all_metric_dict[f'gt_{thresh_label}_{cls}']
+                mr_cnt = all_metric_dict[f'MR_{thresh_label}_{cls}']
+                if gt_val > 0:
+                    epa_val = (hit_val - alpha * fp_val) / gt_val
+                    mr_val = mr_cnt / gt_val
+                else:
+                    epa_val = 0.0
+                    mr_val = 0.0
+                motion_threshold_rows.append({
+                    'Threshold': thresh_label,
+                    'Class': cls,
+                    'ADE': ade_val,
+                    'FDE': fde_val,
+                    'EPA': epa_val,
+                    'MR': mr_val
+                })
+                thresh_rows.append((cls, ade_val, fde_val, epa_val, mr_val))
+            if PrettyTable:
+                thresh_table = PrettyTable()
+                thresh_table.field_names = ['Class', 'ADE', 'FDE', 'EPA', 'MR']
+                for cls, ade_val, fde_val, epa_val, mr_val in thresh_rows:
+                    thresh_table.add_row([
+                        cls, f'{ade_val:.4f}', f'{fde_val:.4f}',
+                        f'{epa_val:.4f}', f'{mr_val:.4f}'
+                    ])
+                log_messages.append(thresh_table.get_string())
+            else:
+                for cls, ade_val, fde_val, epa_val, mr_val in thresh_rows:
+                    log_messages.append(f'    ADE_{thresh_label}_{cls}: {ade_val:.4f}')
+                    log_messages.append(f'    FDE_{thresh_label}_{cls}: {fde_val:.4f}')
+                    log_messages.append(f'    EPA_{thresh_label}_{cls}: {epa_val:.4f}')
+                    log_messages.append(f'    MR_{thresh_label}_{cls}: {mr_val:.4f}')
 
         # NOTE: print planning metric
-        print('\n')
-        print('-------------- Planning --------------')
+        log_messages.append('\n-------------- Planning --------------')
         metric_dict = None
         num_valid = 0
         for res in results:
@@ -1807,28 +1998,72 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             else:
                 for k in res['metric_results'].keys():
                     metric_dict[k] += res['metric_results'][k]
-        
+
+        planning_keys = []
         for k in metric_dict:
             metric_dict[k] = metric_dict[k] / num_valid
-            print("{}:{}".format(k, metric_dict[k]))
+            if k.startswith('plan_') or k == 'fut_valid_flag':
+                planning_rows.append({'Metric': k, 'Value': metric_dict[k]})
+                planning_keys.append(k)
+
+        if PrettyTable:
+            planning_table = PrettyTable()
+            planning_table.field_names = ['Metric', 'Value']
+            for key in sorted(planning_keys):
+                planning_table.add_row([key, f'{metric_dict[key]:.4f}'])
+            log_messages.append(planning_table.get_string())
+        else:
+            for key in sorted(planning_keys):
+                log_messages.append("{}:{}".format(key, metric_dict[key]))
+
+        combined_results = dict(result_dict)
+        combined_results.update(metric_dict)
 
         result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
 
         if isinstance(result_files, dict):
-            results_dict = dict()
+            detection_results = dict()
             for name in result_names:
                 print('Evaluating bboxes of {}'.format(name))
                 ret_dict = self._evaluate_single(result_files[name], metric=metric, map_metric=map_metric)
-            results_dict.update(ret_dict)
+            detection_results.update(ret_dict)
         elif isinstance(result_files, str):
-            results_dict = self._evaluate_single(result_files, metric=metric, map_metric=map_metric)
+            detection_results = self._evaluate_single(result_files, metric=metric, map_metric=map_metric)
 
         if tmp_dir is not None:
             tmp_dir.cleanup()
 
         if show:
             self.show(results, out_dir, pipeline=pipeline)
-        return results_dict
+        combined_results.update(detection_results)
+
+        if detection_results:
+            self._print_detection_summary(detection_results)
+
+        motion_csv = osp.join(summary_dir, 'motion_overall.csv')
+        if _write_csv(motion_csv, ['Metric'] + motion_cls_names, motion_summary_rows):
+            summary_paths.append(motion_csv)
+        motion_thresh_csv = osp.join(summary_dir, 'motion_thresholds.csv')
+        if _write_csv(motion_thresh_csv, ['Threshold', 'Class', 'ADE', 'FDE', 'EPA', 'MR'], motion_threshold_rows):
+            summary_paths.append(motion_thresh_csv)
+        planning_csv = osp.join(summary_dir, 'planning_metrics.csv')
+        if _write_csv(planning_csv, ['Metric', 'Value'], planning_rows):
+            summary_paths.append(planning_csv)
+        detection_csv = osp.join(summary_dir, 'detection_metrics.csv')
+        detection_rows = [{'Metric': k, 'Value': v} for k, v in detection_results.items()]
+        if _write_csv(detection_csv, ['Metric', 'Value'], detection_rows):
+            summary_paths.append(detection_csv)
+
+        if summary_paths:
+            print('\nSaved summary tables:')
+            for path in summary_paths:
+                print(f'  - {path}')
+        self.latest_summary_paths = summary_paths
+
+        for msg in log_messages:
+            print(msg)
+
+        return combined_results
 
 def output_to_nusc_box(detection):
     """Convert the output to the box class in the nuScenes.

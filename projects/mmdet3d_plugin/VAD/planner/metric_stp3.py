@@ -269,8 +269,8 @@ class PlanningMetric():
 
             xx, yy = trajs[i,:,0], trajs[i, :, 1]
             # lidar系下的轨迹转换到图片坐标系下
-            xi = ((-self.bx[0]/2 - yy) / self.dx[0]).long()
-            yi = ((-self.bx[1]/2 + xx) / self.dx[1]).long()
+            xi = ((-self.bx[0]/2 - yy) / self.dx[0]).long().to(segmentation.device)
+            yi = ((-self.bx[1]/2 + xx) / self.dx[1]).long().to(segmentation.device)
 
             m1 = torch.logical_and(
                 torch.logical_and(xi >= 0, xi < self.bev_dimension[0]),
@@ -278,7 +278,7 @@ class PlanningMetric():
             ).to(gt_box_coll.device)
             m1 = torch.logical_and(m1, torch.logical_not(gt_box_coll))
 
-            ti = torch.arange(n_future)
+            ti = torch.arange(n_future, device=segmentation.device)
             obj_coll_sum[ti[m1]] += segmentation[i, ti[m1], xi[m1], yi[m1]].long()
 
             m2 = torch.logical_not(gt_box_coll)

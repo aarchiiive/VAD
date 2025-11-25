@@ -44,7 +44,7 @@ _num_levels_ = 4
 bev_h_ = 200
 bev_w_ = 200
 
-fut_ts = 8
+fut_ts = 5
 num_cams = 8
 queue_length = 4 # each sequence contains `queue_length` frames.
 total_epochs = 60
@@ -54,6 +54,11 @@ model = dict(
     use_grid_mask=True,
     video_test_mode=True,
     pretrained=dict(img='torchvision://resnet50'),
+    class_names=class_names,
+    motion_class_groups=dict(
+        vehicle=['vehicle', 'bicycle'],
+        pedestrian=['pedestrian'],
+    ),
     img_backbone=dict(
         type='ResNet',
         depth=50,
@@ -338,11 +343,6 @@ train_pipeline = [
 
 test_pipeline = [
     dict(type='CustomLoadMultiViewImageFromFiles', to_float32=True, num_workers=4),
-    dict(type='LoadPointsFromFile',
-         coord_type='LIDAR',
-         load_dim=5,
-         use_dim=5,
-         file_client_args=file_client_args),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
     dict(type='CustomObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='CustomObjectNameFilter', classes=class_names),
@@ -350,7 +350,7 @@ test_pipeline = [
     # dict(type='PadMultiViewImage', size_divisor=32),
     dict(
         type='MultiScaleFlipAug3D',
-        img_scale=(1600, 900),
+        img_scale=(1920, 1080),
         pts_scale_ratio=1,
         flip=False,
         transforms=[
@@ -358,7 +358,7 @@ test_pipeline = [
             dict(type='PadMultiViewImage', size_divisor=32, num_workers=4),
             dict(type='CustomDefaultFormatBundle3D', class_names=class_names, with_label=False, with_ego=True),
             dict(type='CustomCollect3D',\
-                 keys=['points', 'gt_bboxes_3d', 'gt_labels_3d', 'img', 'fut_valid_flag',
+                 keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'fut_valid_flag',
                        'ego_his_trajs', 'ego_fut_trajs', 'ego_fut_masks', 'ego_fut_cmd',
                        'ego_lcf_feat', 'gt_attr_labels'])])
 ]
@@ -370,7 +370,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=ann_root + 'vad_navsim_infos_temporal_train_start0_count1.pkl',
+        ann_file=ann_root + 'vad_navsim_infos_temporal_train_start0_count10.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -390,11 +390,12 @@ data = dict(
     val=dict(type=dataset_type,
              data_root=data_root,
              pc_range=point_cloud_range,
-             ann_file=ann_root + 'vad_navsim_infos_temporal_val_start0_count1.pkl',
+             ann_file=ann_root + 'vad_navsim_infos_temporal_train_start0_count1.pkl',
+            #  ann_file=ann_root + 'vad_navsim_infos_temporal_val_start0_count1.pkl',
              pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
              classes=class_names, modality=input_modality, samples_per_gpu=1,
              map_classes=map_classes,
-             map_ann_file=None,
+             map_ann_file=ann_root + 'navsim_map_anns_val.json',
              map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
              map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
               use_pkl_result=True,
@@ -403,11 +404,12 @@ data = dict(
     test=dict(type=dataset_type,
               data_root=data_root,
               pc_range=point_cloud_range,
-              ann_file=ann_root + 'vad_navsim_infos_temporal_val_start0_count1.pkl',
+              ann_file=ann_root + 'vad_navsim_infos_temporal_train_start0_count1.pkl',
+            #   ann_file=ann_root + 'vad_navsim_infos_temporal_val_start0_count1.pkl',
               pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
               classes=class_names, modality=input_modality, samples_per_gpu=1,
               map_classes=map_classes,
-              map_ann_file=None,
+              map_ann_file=ann_root + 'navsim_map_anns_val.json',
               map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
               map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
               use_pkl_result=True,

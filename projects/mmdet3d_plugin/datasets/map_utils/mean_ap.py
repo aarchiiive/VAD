@@ -211,7 +211,7 @@ def format_res_gt_by_classes(result_path,
         cls_gts[clsname] = gts
     
     mmcv.dump([cls_gens, cls_gts],formatting_file)
-    print('Cls data formatting done in {:2f}s!! with {}'.format(float(timer.since_start()),formatting_file))
+    # formatting summary intentionally silent to avoid noisy logs
     pool.close()
     return cls_gens, cls_gts
 
@@ -311,7 +311,7 @@ def eval_map(gen_results,
             'precision': precisions,
             'ap': ap
         })
-        print('cls:{} done in {:2f}s!!'.format(clsname,float(timer.since_last_check())))
+        timer.since_last_check()
     pool.close()
     aps = []
     for cls_result in eval_results:

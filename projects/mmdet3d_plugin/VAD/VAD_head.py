@@ -1139,6 +1139,8 @@ class VADHead(DETRHead):
         loss_plan_l1_weight = ego_fut_cmd[..., None, None] * ego_fut_masks[:, None, :, None]
         loss_plan_l1_weight = loss_plan_l1_weight.repeat(1, 1, 1, 2)
 
+        # print(f"ego_fut_preds: {ego_fut_preds.shape}, ego_fut_gt: {ego_fut_gt.shape}")
+
         loss_plan_l1 = self.loss_plan_reg(
             ego_fut_preds,
             ego_fut_gt,

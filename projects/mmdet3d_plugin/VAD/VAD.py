@@ -34,7 +34,9 @@ class VAD(MVXTwoStageDetector):
                  pretrained=None,
                  video_test_mode=False,
                  fut_ts=6,
-                 fut_mode=6
+                 fut_mode=6,
+                 class_names=None,
+                 motion_class_groups=None
                  ):
 
         super(VAD,
@@ -50,6 +52,34 @@ class VAD(MVXTwoStageDetector):
         self.fut_ts = fut_ts
         self.fut_mode = fut_mode
         self.valid_fut_ts = pts_bbox_head['valid_fut_ts']
+        if class_names is None:
+            class_names = [
+                'car', 'truck', 'construction_vehicle', 'bus',
+                'trailer', 'barrier', 'motorcycle', 'bicycle',
+                'pedestrian', 'traffic_cone'
+            ]
+        self.class_names = class_names
+
+        if motion_class_groups is None:
+            motion_class_groups = {
+                'car': ['car', 'truck', 'construction_vehicle', 'bus', 'trailer'],
+                'pedestrian': ['pedestrian'],
+            }
+        self.motion_class_groups = motion_class_groups
+        self.motion_cls_names = list(motion_class_groups.keys())
+        self.motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit', 'fp', 'ADE', 'FDE', 'MR']
+        self.distance_thresholds = [1.0, 1.5, 2.0]  # evaluation tolerances for ADE/FDE/EPA
+        self.default_match_distance = 2.0
+        self.label_to_motion_class = {}
+        for agg_name, name_list in self.motion_class_groups.items():
+            for name in name_list:
+                self.label_to_motion_class[name] = agg_name
+        dynamic_indices = set()
+        for name_list in self.motion_class_groups.values():
+            for name in name_list:
+                if name in self.class_names:
+                    dynamic_indices.add(self.class_names.index(name))
+        self.dynamic_label_indices = sorted(dynamic_indices)
 
         # temporal
         self.video_test_mode = video_test_mode
@@ -62,11 +92,89 @@ class VAD(MVXTwoStageDetector):
 
         self.planning_metric = None
 
+    @staticmethod
+    def _format_distance_label(value):
+        if float(value).is_integer():
+            return f'{int(value)}m'
+        text = f'{value}'
+        if text.endswith('0'):
+            text = text.rstrip('0').rstrip('.')
+        return f'{text}m'
+
+    def _motion_metrics_for_threshold(
+        self,
+        gt_bbox,
+        gt_label,
+        gt_attr_label,
+        pred_bbox,
+        matched_bbox_result,
+        mapped_class_names,
+        match_dis_thresh=2.0,
+        label_suffix=None,
+    ):
+        motion_cls_names = self.motion_cls_names
+        suffix = f'_{label_suffix}' if label_suffix else ''
+        metric_dict = {}
+        for met in ['gt', 'cnt_ade', 'cnt_fde', 'hit', 'fp', 'ADE', 'FDE', 'MR']:
+            for cls in motion_cls_names:
+                metric_dict[f'{met}{suffix}_{cls}'] = 0.0
+
+        for i in range(pred_bbox['labels_3d'].shape[0]):
+            label_idx = int(pred_bbox['labels_3d'][i])
+            box_name = mapped_class_names[label_idx]
+            agg_cls = self.label_to_motion_class.get(box_name)
+            if agg_cls is None:
+                continue
+            if i not in matched_bbox_result:
+                metric_dict[f'fp{suffix}_{agg_cls}'] += 1
+
+        for i in range(gt_label.shape[0]):
+            label_idx = int(gt_label[i])
+            box_name = mapped_class_names[label_idx]
+            agg_cls = self.label_to_motion_class.get(box_name)
+            if agg_cls is None:
+                continue
+
+            gt_fut_masks = gt_attr_label[i][self.fut_ts * 2:self.fut_ts * 3]
+            num_valid_ts = sum(gt_fut_masks == 1)
+
+            if num_valid_ts == self.fut_ts:
+                metric_dict[f'gt{suffix}_{agg_cls}'] += 1
+
+            if matched_bbox_result[i] >= 0 and num_valid_ts > 0:
+                m_pred_idx = matched_bbox_result[i]
+                gt_fut_trajs = gt_attr_label[i][:self.fut_ts * 2].reshape(-1, 2)
+                gt_fut_trajs = gt_fut_trajs[:num_valid_ts]
+                pred_fut_trajs = pred_bbox['trajs_3d'][m_pred_idx].reshape(self.fut_mode, self.fut_ts, 2)
+                pred_fut_trajs = pred_fut_trajs[:, :num_valid_ts, :]
+
+                gt_fut_trajs = gt_fut_trajs.cumsum(dim=-2)
+                pred_fut_trajs = pred_fut_trajs.cumsum(dim=-2)
+                gt_fut_trajs = gt_fut_trajs + gt_bbox[i].center[0, :2]
+                pred_fut_trajs = pred_fut_trajs + pred_bbox['boxes_3d'][int(m_pred_idx)].center[0, :2]
+
+                dist = torch.linalg.norm(gt_fut_trajs[None, :, :] - pred_fut_trajs, dim=-1)
+                ade = dist.sum(-1) / num_valid_ts
+                ade = ade.min()
+                metric_dict[f'cnt_ade{suffix}_{agg_cls}'] += 1
+                metric_dict[f'ADE{suffix}_{agg_cls}'] += ade
+
+                if num_valid_ts == self.fut_ts:
+                    fde = dist[:, -1].min()
+                    metric_dict[f'cnt_fde{suffix}_{agg_cls}'] += 1
+                    metric_dict[f'FDE{suffix}_{agg_cls}'] += fde
+                    if fde <= match_dis_thresh:
+                        metric_dict[f'hit{suffix}_{agg_cls}'] += 1
+                    else:
+                        metric_dict[f'MR{suffix}_{agg_cls}'] += 1
+
+        return metric_dict
+
     def extract_img_feat(self, img, img_metas, len_queue=None):
         """Extract features of images."""
         B = img.size(0)
         if img is not None:
-            
+
             # input_shape = img.shape[-2:]
             # # update real input shape of each single img
             # for img_meta in img_metas:
@@ -102,7 +210,7 @@ class VAD(MVXTwoStageDetector):
         """Extract features from images and points."""
 
         img_feats = self.extract_img_feat(img, img_metas, len_queue=len_queue)
-        
+
         return img_feats
 
     def forward_pts_train(self,
@@ -110,7 +218,7 @@ class VAD(MVXTwoStageDetector):
                           gt_bboxes_3d,
                           gt_labels_3d,
                           map_gt_bboxes_3d,
-                          map_gt_labels_3d,                          
+                          map_gt_labels_3d,
                           img_metas,
                           gt_bboxes_ignore=None,
                           map_gt_bboxes_ignore=None,
@@ -163,7 +271,7 @@ class VAD(MVXTwoStageDetector):
             return self.forward_train(**kwargs)
         else:
             return self.forward_test(**kwargs)
-    
+
     def obtain_history_bev(self, imgs_queue, img_metas_list):
         """Obtain history BEV features iteratively. To save GPU memory, gradients are not calculated.
         """
@@ -230,7 +338,7 @@ class VAD(MVXTwoStageDetector):
         Returns:
             dict: Losses of different branches.
         """
-        
+
         len_queue = img.size(1)
         prev_img = img[:, :-1, ...]
         img = img[:, -1, ...]
@@ -370,11 +478,7 @@ class VAD(MVXTwoStageDetector):
         gt_attr_labels=None,
     ):
         """Test function"""
-        mapped_class_names = [
-            'car', 'truck', 'construction_vehicle', 'bus',
-            'trailer', 'barrier', 'motorcycle', 'bicycle', 
-            'pedestrian', 'traffic_cone'
-        ]
+        mapped_class_names = self.class_names
 
         outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev,
                                   ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat)
@@ -485,8 +589,10 @@ class VAD(MVXTwoStageDetector):
 
         Returns:
             matched_bbox_result (np.array): assigned pred index for each gt box [num_gt_bbox].
-        """     
-        dynamic_list = [0,1,3,4,6,7,8]
+        """
+        dynamic_list = getattr(self, 'dynamic_label_indices', None)
+        if not dynamic_list:
+            dynamic_list = [0, 1, 3, 4, 6, 7, 8]
         matched_bbox_result = torch.ones(
             (len(gt_bbox)), dtype=torch.long) * -1  # -1: not assigned
         gt_centers = gt_bbox.center[:, :2]
@@ -516,77 +622,37 @@ class VAD(MVXTwoStageDetector):
         mapped_class_names,
         match_dis_thresh=2.0,
     ):
-        """Compute EPA metric for one sample.
-        Args:
-            gt_bboxs (LiDARInstance3DBoxes): GT Bboxs.
-            gt_label (Tensor): GT labels for gt_bbox, [num_gt_bbox].
-            pred_bbox (dict): Predictions.
-                'boxes_3d': (LiDARInstance3DBoxes)
-                'scores_3d': (Tensor), [num_pred_bbox]
-                'labels_3d': (Tensor), [num_pred_bbox]
-                'trajs_3d': (Tensor), [fut_ts*2]
-            matched_bbox_result (np.array): assigned pred index for each gt box [num_gt_bbox].
-            match_dis_thresh (float): dis thresh for determine a positive sample for a gt bbox.
-
-        Returns:
-            EPA_dict (dict): EPA metric dict of each cared class.
-        """
-        motion_cls_names = ['car', 'pedestrian']
-        motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
-                               'fp', 'ADE', 'FDE', 'MR']
-        
+        """Compute motion metrics with optional thresholds."""
         metric_dict = {}
-        for met in motion_metric_names:
-            for cls in motion_cls_names:
-                metric_dict[met+'_'+cls] = 0.0
-
-        veh_list = [0,1,3,4]
-        ignore_list = ['construction_vehicle', 'barrier',
-                       'traffic_cone', 'motorcycle', 'bicycle']
-
-        for i in range(pred_bbox['labels_3d'].shape[0]):
-            pred_bbox['labels_3d'][i] = 0 if pred_bbox['labels_3d'][i] in veh_list else pred_bbox['labels_3d'][i]
-            box_name = mapped_class_names[pred_bbox['labels_3d'][i]]
-            if box_name in ignore_list:
-                continue
-            if i not in matched_bbox_result:
-                metric_dict['fp_'+box_name] += 1
-
-        for i in range(gt_label.shape[0]):
-            gt_label[i] = 0 if gt_label[i] in veh_list else gt_label[i]
-            box_name = mapped_class_names[gt_label[i]]
-            if box_name in ignore_list:
-                continue
-            gt_fut_masks = gt_attr_label[i][self.fut_ts*2:self.fut_ts*3]
-            num_valid_ts = sum(gt_fut_masks==1)
-            if num_valid_ts == self.fut_ts:
-                metric_dict['gt_'+box_name] += 1
-            if matched_bbox_result[i] >= 0 and num_valid_ts > 0:
-                metric_dict['cnt_ade_'+box_name] += 1
-                m_pred_idx = matched_bbox_result[i]
-                gt_fut_trajs = gt_attr_label[i][:self.fut_ts*2].reshape(-1, 2)
-                gt_fut_trajs = gt_fut_trajs[:num_valid_ts]
-                pred_fut_trajs = pred_bbox['trajs_3d'][m_pred_idx].reshape(self.fut_mode, self.fut_ts, 2)
-                pred_fut_trajs = pred_fut_trajs[:, :num_valid_ts, :]
-                gt_fut_trajs = gt_fut_trajs.cumsum(dim=-2)
-                pred_fut_trajs = pred_fut_trajs.cumsum(dim=-2)
-                gt_fut_trajs = gt_fut_trajs + gt_bbox[i].center[0, :2]
-                pred_fut_trajs = pred_fut_trajs + pred_bbox['boxes_3d'][int(m_pred_idx)].center[0, :2]
-
-                dist = torch.linalg.norm(gt_fut_trajs[None, :, :] - pred_fut_trajs, dim=-1)
-                ade = dist.sum(-1) / num_valid_ts
-                ade = ade.min()
-
-                metric_dict['ADE_'+box_name] += ade
-                if num_valid_ts == self.fut_ts:
-                    fde = dist[:, -1].min()
-                    metric_dict['cnt_fde_'+box_name] += 1
-                    metric_dict['FDE_'+box_name] += fde
-                    if fde <= match_dis_thresh:
-                        metric_dict['hit_'+box_name] += 1
-                    else:
-                        metric_dict['MR_'+box_name] += 1
-
+        thresholds = getattr(self, 'distance_thresholds', [1.0, 1.5, 2.0])
+        default_thresh = getattr(self, 'default_match_distance', match_dis_thresh)
+        for thresh in thresholds:
+            label = self._format_distance_label(thresh)
+            per_thresh_match = self.assign_pred_to_gt_vip3d(
+                pred_bbox, gt_bbox, gt_label, match_dis_thresh=thresh)
+            metric_dict.update(
+                self._motion_metrics_for_threshold(
+                    gt_bbox,
+                    gt_label,
+                    gt_attr_label,
+                    pred_bbox,
+                    per_thresh_match,
+                    mapped_class_names,
+                    match_dis_thresh=thresh,
+                    label_suffix=label,
+                ))
+            if abs(thresh - default_thresh) < 1e-6:
+                metric_dict.update(
+                    self._motion_metrics_for_threshold(
+                        gt_bbox,
+                        gt_label,
+                        gt_attr_label,
+                        pred_bbox,
+                        per_thresh_match,
+                        mapped_class_names,
+                        match_dis_thresh=thresh,
+                        label_suffix=None,
+                    ))
         return metric_dict
 
     ### same planning metric as stp3
@@ -617,6 +683,9 @@ class VAD(MVXTwoStageDetector):
             self.planning_metric = PlanningMetric()
         segmentation, pedestrian = self.planning_metric.get_label(
             gt_agent_boxes, gt_agent_feats)
+        device = gt_ego_fut_trajs.device
+        segmentation = segmentation.to(device)
+        pedestrian = pedestrian.to(device)
         occupancy = torch.logical_or(segmentation, pedestrian)
 
         for i in range(future_second):
@@ -637,8 +706,8 @@ class VAD(MVXTwoStageDetector):
                 metric_dict['plan_L2_{}s'.format(i+1)] = 0.0
                 metric_dict['plan_obj_col_{}s'.format(i+1)] = 0.0
                 metric_dict['plan_obj_box_col_{}s'.format(i+1)] = 0.0
-            
+
         return metric_dict
 
-    def set_epoch(self, epoch): 
+    def set_epoch(self, epoch):
         self.pts_bbox_head.epoch = epoch
