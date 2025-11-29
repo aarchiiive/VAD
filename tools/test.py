@@ -11,6 +11,7 @@ import mmcv
 import os
 import copy
 import torch
+import torch.distributed as dist
 torch.multiprocessing.set_sharing_strategy('file_system')
 import warnings
 from mmcv import Config, DictAction
@@ -259,11 +260,14 @@ def main():
         outputs = {'bbox_results': bbox_results}
         if mask_results is not None:
             outputs['mask_results'] = mask_results
-    rank, _ = get_dist_info()
+    rank, world_size = get_dist_info()
+    if world_size > 1:
+        dist.barrier()
+
     if rank == 0:
         cfg_name = args.config.split('/')[-1].split('.')[0]
-        timestamp = time.ctime().replace(' ', '_').replace(':', '_')
-        default_prefix = osp.join('test', cfg_name, timestamp)
+        timestamp = time.strftime('%y%m%d_%H%M%S', time.localtime())
+        default_prefix = osp.join('test', f'{timestamp}_{cfg_name}')
 
         kwargs = {} if args.eval_options is None else args.eval_options
         kwargs['jsonfile_prefix'] = default_prefix
@@ -283,22 +287,39 @@ def main():
         ]:
             eval_kwargs.pop(key, None)
         eval_kwargs.update(dict(metric=eval_metrics, **kwargs))
-
-        evaluation_results = dataset.evaluate(outputs['bbox_results'], **eval_kwargs)
-        summary_paths = getattr(dataset, 'latest_summary_paths', [])
-
-        bundle = dict(
+        format_state = dict(
             bbox_results=outputs['bbox_results'],
             formatted_results=formatted_results,
-            evaluation_metrics=evaluation_results,
-            summary_paths=summary_paths,
+            eval_kwargs=eval_kwargs,
             jsonfile_prefix=default_prefix,
-        )
+            config=args.config,
+            checkpoint=args.checkpoint,
+            timestamp=timestamp)
+        format_state_path = osp.join(default_prefix, 'format_state.pkl')
+        mmcv.mkdir_or_exist(osp.dirname(format_state_path))
+        print(f'\nSaving format-state to {format_state_path}')
+        mmcv.dump(format_state, format_state_path)
 
-        bundle_path = args.out if args.out else osp.join(default_prefix, 'bbox_results.pkl')
-        mmcv.mkdir_or_exist(osp.dirname(bundle_path))
-        print(f'\nSaving bundled results to {bundle_path}')
-        mmcv.dump(bundle, bundle_path)
+        evaluation_results = dataset.evaluate(outputs['bbox_results'], **eval_kwargs)
+        # summary_paths = getattr(dataset, 'latest_summary_paths', [])
+
+        # bundle = dict(
+        #     bbox_results=outputs['bbox_results'],
+        #     formatted_results=formatted_results,
+        #     evaluation_metrics=evaluation_results,
+        #     summary_paths=summary_paths,
+        #     jsonfile_prefix=default_prefix,
+        # )
+
+        # bundle_path = args.out if args.out else osp.join(default_prefix, 'bbox_results.pkl')
+        # mmcv.mkdir_or_exist(osp.dirname(bundle_path))
+        # print(f'\nSaving bundled results to {bundle_path}')
+        # mmcv.dump(bundle, bundle_path)
+
+    #     if world_size > 1:
+    #         dist.barrier()
+    # elif world_size > 1:
+    #     dist.barrier()
 
         # # # NOTE: record to json
         # json_path = args.json_dir
@@ -318,5 +339,8 @@ def main():
         # print('save to json done')
 
 if __name__ == '__main__':
-    torch.multiprocessing.set_start_method('fork')
+    try:
+        torch.multiprocessing.set_start_method('fork')
+    except RuntimeError:
+        pass
     main()

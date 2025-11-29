@@ -14,7 +14,7 @@ voxel_size = [0.15, 0.15, 4]
 # img_norm_cfg = dict(
 #     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 img_norm_cfg = dict(
-   mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
+    mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
 # For nuScenes we usually do 10-class detection
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
@@ -46,11 +46,20 @@ bev_w_ = 200
 queue_length = 4 # each sequence contains `queue_length` frames.
 total_epochs = 60
 
+experiment = dict(
+    name='VAD_base_e2e',
+    project='VAD',
+    use_timestamp=True,
+    tags=['baseline'])
+
+num_train_scenes = 100  # set >0 to subsample training scenes
+
 model = dict(
     type='VAD',
     use_grid_mask=True,
     video_test_mode=True,
-    pretrained=dict(img='torchvision://resnet50'),
+    # pretrained=dict(img='torchvision://resnet50'),
+    pretrained=dict(img='ckpts/resnet50-19c8e357.pth'),
     img_backbone=dict(
         type='ResNet',
         depth=50,
@@ -378,7 +387,9 @@ data = dict(
         # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
         # and box_type_3d='Depth' in sunrgbd and scannet dataset.
         box_type_3d='LiDAR',
-        custom_eval_version='vad_nusc_detection_cvpr_2019'),
+        custom_eval_version='vad_nusc_detection_cvpr_2019',
+        num_scenes=num_train_scenes,
+        scene_tokens_file=None),
     val=dict(type=dataset_type,
              data_root=data_root,
              pc_range=point_cloud_range,
@@ -429,6 +440,14 @@ evaluation = dict(interval=total_epochs, pipeline=test_pipeline, metric='bbox', 
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 
+wandb_init_kwargs = dict(
+    project=experiment['project'],
+    name=experiment['name'])
+if experiment.get('tags'):
+    wandb_init_kwargs['tags'] = experiment['tags']
+if experiment.get('notes'):
+    wandb_init_kwargs['notes'] = experiment['notes']
+
 log_config = dict(
     interval=10,
     hooks=[
@@ -436,7 +455,7 @@ log_config = dict(
         dict(type='TensorboardLoggerHook'),
         dict(
             type='WandbLoggerHook',
-            init_kwargs=dict(project='VAD', name='VAD_base_e2e'))
+            init_kwargs=wandb_init_kwargs)
     ])
 # fp16 = dict(loss_scale=512.)
 # find_unused_parameters = True
