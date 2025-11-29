@@ -260,47 +260,46 @@ def main():
         outputs = {'bbox_results': bbox_results}
         if mask_results is not None:
             outputs['mask_results'] = mask_results
-    rank, world_size = get_dist_info()
-    if world_size > 1:
-        dist.barrier()
+    rank, _ = get_dist_info()
+    if rank != 0:
+        return
 
-    if rank == 0:
-        cfg_name = args.config.split('/')[-1].split('.')[0]
-        timestamp = time.strftime('%y%m%d_%H%M%S', time.localtime())
-        default_prefix = osp.join('test', f'{timestamp}_{cfg_name}')
+    cfg_name = args.config.split('/')[-1].split('.')[0]
+    timestamp = time.strftime('%y%m%d_%H%M%S', time.localtime())
+    default_prefix = osp.join('test', f'{timestamp}_{cfg_name}')
 
-        kwargs = {} if args.eval_options is None else args.eval_options
-        kwargs['jsonfile_prefix'] = default_prefix
-        result_files, tmp_dir = dataset.format_results(outputs['bbox_results'], **kwargs)
-        if tmp_dir is not None:
-            tmp_dir.cleanup()
-        if isinstance(result_files, dict):
-            formatted_results = result_files
-        else:
-            formatted_results = {'pts_bbox': result_files}
+    kwargs = {} if args.eval_options is None else args.eval_options
+    kwargs['jsonfile_prefix'] = default_prefix
+    result_files, tmp_dir = dataset.format_results(outputs['bbox_results'], **kwargs)
+    if tmp_dir is not None:
+        tmp_dir.cleanup()
+    if isinstance(result_files, dict):
+        formatted_results = result_files
+    else:
+        formatted_results = {'pts_bbox': result_files}
 
-        eval_metrics = args.eval if args.eval else ['bbox']
-        eval_kwargs = cfg.get('evaluation', {}).copy()
-        for key in [
-                'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                'rule'
-        ]:
-            eval_kwargs.pop(key, None)
-        eval_kwargs.update(dict(metric=eval_metrics, **kwargs))
-        format_state = dict(
-            bbox_results=outputs['bbox_results'],
-            formatted_results=formatted_results,
-            eval_kwargs=eval_kwargs,
-            jsonfile_prefix=default_prefix,
-            config=args.config,
-            checkpoint=args.checkpoint,
-            timestamp=timestamp)
-        format_state_path = osp.join(default_prefix, 'format_state.pkl')
-        mmcv.mkdir_or_exist(osp.dirname(format_state_path))
-        print(f'\nSaving format-state to {format_state_path}')
-        mmcv.dump(format_state, format_state_path)
+    eval_metrics = args.eval if args.eval else ['bbox']
+    eval_kwargs = cfg.get('evaluation', {}).copy()
+    for key in [
+            'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
+            'rule'
+    ]:
+        eval_kwargs.pop(key, None)
+    eval_kwargs.update(dict(metric=eval_metrics, **kwargs))
+    format_state = dict(
+        bbox_results=outputs['bbox_results'],
+        formatted_results=formatted_results,
+        eval_kwargs=eval_kwargs,
+        jsonfile_prefix=default_prefix,
+        config=args.config,
+        checkpoint=args.checkpoint,
+        timestamp=timestamp)
+    format_state_path = osp.join(default_prefix, 'format_state.pkl')
+    mmcv.mkdir_or_exist(osp.dirname(format_state_path))
+    print(f'\nSaving format-state to {format_state_path}')
+    mmcv.dump(format_state, format_state_path)
 
-        evaluation_results = dataset.evaluate(outputs['bbox_results'], **eval_kwargs)
+    evaluation_results = dataset.evaluate(outputs['bbox_results'], **eval_kwargs)
         # summary_paths = getattr(dataset, 'latest_summary_paths', [])
 
         # bundle = dict(
