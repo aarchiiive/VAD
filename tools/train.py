@@ -144,6 +144,46 @@ def main():
 
             # from projects.mmdet3d_plugin.bevformer.apis import custom_train_model
             from projects.mmdet3d_plugin.VAD.apis.train import custom_train_model
+    # --- Experiment naming / logging metadata ---
+    exp_cfg = cfg.setdefault('experiment', {})
+    default_run_name = exp_cfg.get('name') or osp.splitext(
+        osp.basename(args.config))[0]
+    exp_cfg['name'] = default_run_name
+    train_scene_limit = 0
+    data_cfg = getattr(cfg, 'data', None)
+    if isinstance(data_cfg, dict):
+        train_section = data_cfg.get('train')
+        if train_section is not None:
+            limit_val = train_section.get('scene_limit', 0)
+            if isinstance(limit_val, int) and limit_val > 0:
+                train_scene_limit = limit_val
+    if train_scene_limit > 0:
+        exp_cfg['name'] = f'{exp_cfg["name"]}_{train_scene_limit}'
+        default_run_name = exp_cfg['name']
+    exp_cfg.setdefault('project', None)
+    exp_cfg.setdefault('use_timestamp', True)
+    exp_cfg.setdefault('tags', None)
+    exp_cfg.setdefault('notes', None)
+
+    run_timestamp = time.strftime('%y%m%d_%H%M%S', time.localtime())
+    exp_cfg['timestamp'] = run_timestamp
+    resolved_run_name = default_run_name
+    if exp_cfg.get('use_timestamp', True):
+        resolved_run_name = f'{run_timestamp}_{resolved_run_name}'
+    exp_cfg['resolved_name'] = resolved_run_name
+
+    # Propagate resolved metadata into WandB hook so UI/work_dirs match.
+    if cfg.get('log_config', None):
+        for hook in cfg.log_config.get('hooks', []):
+            if hook.get('type') == 'WandbLoggerHook':
+                init_kwargs = hook.setdefault('init_kwargs', {})
+                if exp_cfg.get('project'):
+                    init_kwargs['project'] = exp_cfg['project']
+                init_kwargs['name'] = exp_cfg['resolved_name']
+                if exp_cfg.get('tags') is not None:
+                    init_kwargs['tags'] = exp_cfg['tags']
+                if exp_cfg.get('notes') is not None:
+                    init_kwargs['notes'] = exp_cfg['notes']
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
@@ -154,8 +194,13 @@ def main():
         cfg.work_dir = args.work_dir
     elif cfg.get('work_dir', None) is None:
         # use config filename as default work_dir if cfg.work_dir is None
-        cfg.work_dir = osp.join('./work_dirs',
-                                osp.splitext(osp.basename(args.config))[0])
+        cfg.work_dir = osp.join('./work_dirs', exp_cfg['resolved_name'])
+    if cfg.get('data', None):
+        train_cfg = cfg.data.get('train')
+        if train_cfg is not None and train_scene_limit > 0:
+            if not train_cfg.get('scene_tokens_file'):
+                filename = f'{exp_cfg["resolved_name"]}_train_scene_tokens.json'
+                train_cfg['scene_tokens_file'] = osp.join(cfg.work_dir, filename)
     # if args.resume_from is not None:
     if args.resume_from is not None and osp.isfile(args.resume_from):
         cfg.resume_from = args.resume_from
@@ -184,7 +229,7 @@ def main():
     # dump config
     cfg.dump(osp.join(cfg.work_dir, osp.basename(args.config)))
     # init the logger before other steps
-    timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
+    timestamp = exp_cfg['timestamp']
     log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
     # specify logger name, if we still use 'mmdet', the output info will be
     # filtered and won't be saved in the log_file
@@ -265,5 +310,5 @@ def main():
 
 
 if __name__ == '__main__':
-    torch.multiprocessing.set_start_method('fork')
+    # torch.multiprocessing.set_start_method('fork')
     main()
