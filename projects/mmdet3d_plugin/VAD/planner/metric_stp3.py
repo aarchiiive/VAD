@@ -50,7 +50,7 @@ class PlanningMetric():
         nx = torch.LongTensor([(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]])
 
         return dx, bx, nx
-    
+
     def calculate_birds_eye_view_parameters(self, x_bounds, y_bounds, z_bounds):
         """
         Parameters
@@ -71,7 +71,7 @@ class PlanningMetric():
                                     dtype=torch.long)
 
         return bev_resolution, bev_start_position, bev_dimension
-    
+
     def get_label(
             self,
             gt_agent_boxes,
@@ -82,7 +82,7 @@ class PlanningMetric():
         pedestrian = torch.from_numpy(pedestrian_np).long().unsqueeze(0)
 
         return segmentation, pedestrian
-    
+
     def get_birds_eye_view_label(
             self,
             gt_agent_boxes,
@@ -94,7 +94,7 @@ class PlanningMetric():
         gt_agent_feats: (B, A, 34)
             dim 34 = fut_traj(6*2) + fut_mask(6) + goal(1) + lcf_feat(9) + fut_yaw(6)
             lcf_feat (x, y, yaw, vx, vy, width, length, height, type)
-        ego_lcf_feats: (B, 9) 
+        ego_lcf_feats: (B, 9)
             dim 8 = (vx, vy, ax, ay, w, length, width, vel, steer)
         '''
         T = 6
@@ -115,7 +115,7 @@ class PlanningMetric():
         gt_agent_boxes[:,6:7] = -1*(gt_agent_boxes[:,6:7] + np.pi/2) # NOTE: convert yaw to lidar frame
         gt_agent_fut_trajs = gt_agent_fut_trajs + gt_agent_boxes[:, np.newaxis, 0:2]
         gt_agent_fut_yaw = gt_agent_fut_yaw + gt_agent_boxes[:, np.newaxis, 6:7]
-        
+
         for t in range(T):
             for i in range(agent_num):
                 if gt_agent_fut_mask[i][t] == 1:
@@ -132,7 +132,7 @@ class PlanningMetric():
                     if (category_index in self.category_index['human']):
                         poly_region = self._get_poly_region_in_image(param)
                         cv2.fillPoly(pedestrian[t], [poly_region], 1.0)
-        
+
         # vis for debug
         # plt.figure('debug')
         # for i in range(T):
@@ -144,7 +144,7 @@ class PlanningMetric():
         # plt.close()
 
         return segmentation, pedestrian
-    
+
     def _get_poly_region_in_image(self,param):
         lidar2cv_rot = np.array([[1,0], [0,-1]])
         x_a,y_a,yaw_a,agent_length, agent_width = param
@@ -169,7 +169,7 @@ class PlanningMetric():
             自车lidar系为轨迹参考系
                 ^ y
                 |
-                | 
+                |
                 0------->
                         x
         segmentation: torch.Tensor (n_future, 200, 200)
@@ -190,7 +190,7 @@ class PlanningMetric():
         # 轨迹坐标系转换为:
         #  ^ x
         #  |
-        #  | 
+        #  |
         #  0-------> y
         trajs_ = copy.deepcopy(trajs)
         trajs_[:,:,[0,1]] = trajs_[:,:,[1,0]] # can also change original tensor
@@ -212,7 +212,7 @@ class PlanningMetric():
                 np.logical_and(cc >= 0, cc < self.bev_dimension[1]),
             )
             collision[t] = np.any(segmentation[t, rr[I], cc[I]].cpu().numpy())
-        
+
         # vis for debug
         # obs_occ = copy.deepcopy(segmentation)
         # ego_occ = torch.zeros_like(obs_occ)
@@ -224,7 +224,7 @@ class PlanningMetric():
         #         np.logical_and(cc >= 0, cc < self.bev_dimension[1]),
         #     )
         #     ego_occ[t, rr[I], cc[I]]=1
-        
+
         # plt.figure()
         # for i in range(6):
         #     plt.subplot(2,6,i+1)
@@ -240,9 +240,9 @@ class PlanningMetric():
         return torch.from_numpy(collision).to(device=traj.device)
 
     def evaluate_coll(
-            self, 
-            trajs, 
-            gt_trajs, 
+            self,
+            trajs,
+            gt_trajs,
             segmentation
         ):
         '''
@@ -250,7 +250,7 @@ class PlanningMetric():
             自车lidar系为轨迹参考系
             ^ y
             |
-            | 
+            |
             0------->
                     x
         gt_trajs: torch.Tensor (B, n_future, 2)
@@ -304,7 +304,7 @@ class PlanningMetric():
             )
             / pred_len
         )
-        
+
         return ade
 
     # def update(self, trajs, gt_trajs, segmentation):
