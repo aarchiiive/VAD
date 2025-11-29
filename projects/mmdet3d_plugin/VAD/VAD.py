@@ -36,7 +36,8 @@ class VAD(MVXTwoStageDetector):
                  fut_ts=6,
                  fut_mode=6,
                  class_names=None,
-                 motion_class_groups=None
+                 motion_class_groups=None,
+                 freeze_backbone=False
                  ):
 
         super(VAD,
@@ -52,6 +53,10 @@ class VAD(MVXTwoStageDetector):
         self.fut_ts = fut_ts
         self.fut_mode = fut_mode
         self.valid_fut_ts = pts_bbox_head['valid_fut_ts']
+        if freeze_backbone:
+            for name, param in self.named_parameters():
+                if 'img_backbone' in name or 'pts_backbone' in name:
+                    param.requires_grad = False
         if class_names is None:
             class_names = [
                 'car', 'truck', 'construction_vehicle', 'bus',
@@ -100,75 +105,6 @@ class VAD(MVXTwoStageDetector):
         if text.endswith('0'):
             text = text.rstrip('0').rstrip('.')
         return f'{text}m'
-
-    def _motion_metrics_for_threshold(
-        self,
-        gt_bbox,
-        gt_label,
-        gt_attr_label,
-        pred_bbox,
-        matched_bbox_result,
-        mapped_class_names,
-        match_dis_thresh=2.0,
-        label_suffix=None,
-    ):
-        motion_cls_names = self.motion_cls_names
-        suffix = f'_{label_suffix}' if label_suffix else ''
-        metric_dict = {}
-        for met in ['gt', 'cnt_ade', 'cnt_fde', 'hit', 'fp', 'ADE', 'FDE', 'MR']:
-            for cls in motion_cls_names:
-                metric_dict[f'{met}{suffix}_{cls}'] = 0.0
-
-        for i in range(pred_bbox['labels_3d'].shape[0]):
-            label_idx = int(pred_bbox['labels_3d'][i])
-            box_name = mapped_class_names[label_idx]
-            agg_cls = self.label_to_motion_class.get(box_name)
-            if agg_cls is None:
-                continue
-            if i not in matched_bbox_result:
-                metric_dict[f'fp{suffix}_{agg_cls}'] += 1
-
-        for i in range(gt_label.shape[0]):
-            label_idx = int(gt_label[i])
-            box_name = mapped_class_names[label_idx]
-            agg_cls = self.label_to_motion_class.get(box_name)
-            if agg_cls is None:
-                continue
-
-            gt_fut_masks = gt_attr_label[i][self.fut_ts * 2:self.fut_ts * 3]
-            num_valid_ts = sum(gt_fut_masks == 1)
-
-            if num_valid_ts == self.fut_ts:
-                metric_dict[f'gt{suffix}_{agg_cls}'] += 1
-
-            if matched_bbox_result[i] >= 0 and num_valid_ts > 0:
-                m_pred_idx = matched_bbox_result[i]
-                gt_fut_trajs = gt_attr_label[i][:self.fut_ts * 2].reshape(-1, 2)
-                gt_fut_trajs = gt_fut_trajs[:num_valid_ts]
-                pred_fut_trajs = pred_bbox['trajs_3d'][m_pred_idx].reshape(self.fut_mode, self.fut_ts, 2)
-                pred_fut_trajs = pred_fut_trajs[:, :num_valid_ts, :]
-
-                gt_fut_trajs = gt_fut_trajs.cumsum(dim=-2)
-                pred_fut_trajs = pred_fut_trajs.cumsum(dim=-2)
-                gt_fut_trajs = gt_fut_trajs + gt_bbox[i].center[0, :2]
-                pred_fut_trajs = pred_fut_trajs + pred_bbox['boxes_3d'][int(m_pred_idx)].center[0, :2]
-
-                dist = torch.linalg.norm(gt_fut_trajs[None, :, :] - pred_fut_trajs, dim=-1)
-                ade = dist.sum(-1) / num_valid_ts
-                ade = ade.min()
-                metric_dict[f'cnt_ade{suffix}_{agg_cls}'] += 1
-                metric_dict[f'ADE{suffix}_{agg_cls}'] += ade
-
-                if num_valid_ts == self.fut_ts:
-                    fde = dist[:, -1].min()
-                    metric_dict[f'cnt_fde{suffix}_{agg_cls}'] += 1
-                    metric_dict[f'FDE{suffix}_{agg_cls}'] += fde
-                    if fde <= match_dis_thresh:
-                        metric_dict[f'hit{suffix}_{agg_cls}'] += 1
-                    else:
-                        metric_dict[f'MR{suffix}_{agg_cls}'] += 1
-
-        return metric_dict
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
         """Extract features of images."""
@@ -478,7 +414,13 @@ class VAD(MVXTwoStageDetector):
         gt_attr_labels=None,
     ):
         """Test function"""
-        mapped_class_names = self.class_names
+        # NOTE: use fixed class ordering to match original evaluation setup.
+        # mapped_class_names = self.class_names
+        mapped_class_names = [
+            'car', 'truck', 'construction_vehicle', 'bus',
+            'trailer', 'barrier', 'motorcycle', 'bicycle',
+            'pedestrian', 'traffic_cone'
+        ]
 
         outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev,
                                   ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat)
@@ -512,12 +454,15 @@ class VAD(MVXTwoStageDetector):
             bbox_result['labels_3d'] = bbox_result['labels_3d'][mask]
             bbox_result['trajs_3d'] = bbox_result['trajs_3d'][mask]
 
-            matched_bbox_result = self.assign_pred_to_gt_vip3d(
-                bbox_result, gt_bbox, gt_label)
+            # matched_bbox_result = self.assign_pred_to_gt_vip3d(
+            #     bbox_result, gt_bbox, gt_label)
 
-            metric_dict = self.compute_motion_metric_vip3d(
-                gt_bbox, gt_label, gt_attr_label, bbox_result,
-                matched_bbox_result, mapped_class_names)
+            # metric_dict = self.compute_motion_metric_vip3d(
+            #     gt_bbox, gt_label, gt_attr_label, bbox_result,
+            #     matched_bbox_result, mapped_class_names)
+            metric_dict = self.eval_match_sweep_vip3d(
+                gt_bbox, gt_label, gt_attr_label, bbox_result, mapped_class_names)
+            # metric_dict.update(match_metrics)
 
             # ego planning metric
             assert ego_fut_trajs.shape[0] == 1, 'only support batch_size=1 for testing'
@@ -590,9 +535,7 @@ class VAD(MVXTwoStageDetector):
         Returns:
             matched_bbox_result (np.array): assigned pred index for each gt box [num_gt_bbox].
         """
-        dynamic_list = getattr(self, 'dynamic_label_indices', None)
-        if not dynamic_list:
-            dynamic_list = [0, 1, 3, 4, 6, 7, 8]
+        dynamic_list = [0,1,3,4,6,7,8]
         matched_bbox_result = torch.ones(
             (len(gt_bbox)), dtype=torch.long) * -1  # -1: not assigned
         gt_centers = gt_bbox.center[:, :2]
@@ -622,38 +565,195 @@ class VAD(MVXTwoStageDetector):
         mapped_class_names,
         match_dis_thresh=2.0,
     ):
-        """Compute motion metrics with optional thresholds."""
+        """Compute EPA metric for one sample.
+        Args:
+            gt_bboxs (LiDARInstance3DBoxes): GT Bboxs.
+            gt_label (Tensor): GT labels for gt_bbox, [num_gt_bbox].
+            pred_bbox (dict): Predictions.
+                'boxes_3d': (LiDARInstance3DBoxes)
+                'scores_3d': (Tensor), [num_pred_bbox]
+                'labels_3d': (Tensor), [num_pred_bbox]
+                'trajs_3d': (Tensor), [fut_ts*2]
+            matched_bbox_result (np.array): assigned pred index for each gt box [num_gt_bbox].
+            match_dis_thresh (float): dis thresh for determine a positive sample for a gt bbox.
+
+        Returns:
+            EPA_dict (dict): EPA metric dict of each cared class.
+        """
+        motion_cls_names = ['car', 'pedestrian']
+        motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
+                               'fp', 'ADE', 'FDE', 'MR']
+
         metric_dict = {}
-        thresholds = getattr(self, 'distance_thresholds', [1.0, 1.5, 2.0])
-        default_thresh = getattr(self, 'default_match_distance', match_dis_thresh)
-        for thresh in thresholds:
-            label = self._format_distance_label(thresh)
-            per_thresh_match = self.assign_pred_to_gt_vip3d(
-                pred_bbox, gt_bbox, gt_label, match_dis_thresh=thresh)
-            metric_dict.update(
-                self._motion_metrics_for_threshold(
-                    gt_bbox,
-                    gt_label,
-                    gt_attr_label,
-                    pred_bbox,
-                    per_thresh_match,
-                    mapped_class_names,
-                    match_dis_thresh=thresh,
-                    label_suffix=label,
-                ))
-            if abs(thresh - default_thresh) < 1e-6:
-                metric_dict.update(
-                    self._motion_metrics_for_threshold(
-                        gt_bbox,
-                        gt_label,
-                        gt_attr_label,
-                        pred_bbox,
-                        per_thresh_match,
-                        mapped_class_names,
-                        match_dis_thresh=thresh,
-                        label_suffix=None,
-                    ))
+        for met in motion_metric_names:
+            for cls in motion_cls_names:
+                metric_dict[met+'_'+cls] = 0.0
+
+        veh_list = [0,1,3,4]
+        ignore_list = ['construction_vehicle', 'barrier',
+                       'traffic_cone', 'motorcycle', 'bicycle']
+
+        for i in range(pred_bbox['labels_3d'].shape[0]):
+            pred_bbox['labels_3d'][i] = 0 if pred_bbox['labels_3d'][i] in veh_list else pred_bbox['labels_3d'][i]
+            box_name = mapped_class_names[pred_bbox['labels_3d'][i]]
+            if box_name in ignore_list:
+                continue
+            if i not in matched_bbox_result:
+                metric_dict['fp_'+box_name] += 1
+
+        for i in range(gt_label.shape[0]):
+            gt_label[i] = 0 if gt_label[i] in veh_list else gt_label[i]
+            box_name = mapped_class_names[gt_label[i]]
+            if box_name in ignore_list:
+                continue
+            gt_fut_masks = gt_attr_label[i][self.fut_ts*2:self.fut_ts*3]
+            num_valid_ts = sum(gt_fut_masks==1)
+            if num_valid_ts == self.fut_ts:
+                metric_dict['gt_'+box_name] += 1
+            if matched_bbox_result[i] >= 0 and num_valid_ts > 0:
+                metric_dict['cnt_ade_'+box_name] += 1
+                m_pred_idx = matched_bbox_result[i]
+                gt_fut_trajs = gt_attr_label[i][:self.fut_ts*2].reshape(-1, 2)
+                gt_fut_trajs = gt_fut_trajs[:num_valid_ts]
+                pred_fut_trajs = pred_bbox['trajs_3d'][m_pred_idx].reshape(self.fut_mode, self.fut_ts, 2)
+                pred_fut_trajs = pred_fut_trajs[:, :num_valid_ts, :]
+                gt_fut_trajs = gt_fut_trajs.cumsum(dim=-2)
+                pred_fut_trajs = pred_fut_trajs.cumsum(dim=-2)
+                gt_fut_trajs = gt_fut_trajs + gt_bbox[i].center[0, :2]
+                pred_fut_trajs = pred_fut_trajs + pred_bbox['boxes_3d'][int(m_pred_idx)].center[0, :2]
+
+                dist = torch.linalg.norm(gt_fut_trajs[None, :, :] - pred_fut_trajs, dim=-1)
+                ade = dist.sum(-1) / num_valid_ts
+                ade = ade.min()
+
+                metric_dict['ADE_'+box_name] += ade
+                if num_valid_ts == self.fut_ts:
+                    fde = dist[:, -1].min()
+                    metric_dict['cnt_fde_'+box_name] += 1
+                    metric_dict['FDE_'+box_name] += fde
+                    if fde <= match_dis_thresh:
+                        metric_dict['hit_'+box_name] += 1
+                    else:
+                        metric_dict['MR_'+box_name] += 1
+
+        # metric_lines = []
+        # for cls in motion_cls_names:
+        #     parts = []
+        #     for met in motion_metric_names:
+        #         key = f'{met}_{cls}'
+        #         if key not in metric_dict:
+        #             continue
+        #         value = metric_dict[key]
+        #         if isinstance(value, float):
+        #             parts.append(f'{met}={value:.4f}')
+        #         else:
+        #             parts.append(f'{met}={value}')
+        #     if parts:
+        #         metric_lines.append(f'{cls}: ' + ', '.join(parts))
+        # if metric_lines:
+        #     print('[MotionMetric] ' + ' | '.join(metric_lines))
+        # else:
+        #     print('[MotionMetric] metric_dict is empty')
+        # for key, value in list(metric_dict.items()):
+        #     if not isinstance(value, float):
+        #         continue
+        #     if key.startswith('ADE_'):
+        #         cnt_key = key.replace('ADE_', 'cnt_ade_')
+        #     elif key.startswith('FDE_'):
+        #         cnt_key = key.replace('FDE_', 'cnt_fde_')
+        #     else:
+        #         continue
+        #     if metric_dict.get(cnt_key, 0) > 0:
+        #         metric_dict[key] = value / metric_dict[cnt_key]
+
         return metric_dict
+
+    def eval_match_sweep_vip3d(
+        self,
+        gt_bbox,
+        gt_label,
+        gt_attr_label,
+        pred_bbox,
+        mapped_class_names,
+    ):
+        """Evaluate VIP3D motion metrics under multiple matching thresholds.
+
+        This function sweeps over different matching distance thresholds for the
+        GT–prediction assignment stage (1.0m, 1.5m, 2.0m). The motion-evaluation
+        threshold for FDE (Final Displacement Error) is kept fixed at 2.0m,
+        following the default VIP3D metric definition.
+
+        The purpose is to analyze how sensitive the motion metrics are to the
+        strictness of object-level center-distance matching.
+
+        Args:
+            gt_bbox (LiDARInstance3DBoxes):
+                Ground-truth 3D bounding boxes.
+            gt_label (Tensor):
+                Class labels for ground-truth boxes, shape [num_gt].
+            gt_attr_label (Tensor):
+                GT future trajectories and valid masks encoded in the VIP3D format.
+            pred_bbox (dict):
+                Prediction outputs including boxes_3d, labels_3d, and trajs_3d.
+            mapped_class_names (dict):
+                Mapping from numeric class IDs to class-name strings.
+
+        Returns:
+            dict: A dictionary containing metric results for each matching-threshold
+                setting. Keys follow the format:
+                    "match_1.0m", "match_1.5m", "match_2.0m"
+        """
+
+        # Thresholds used only for the object-level matching stage.
+        match_thresholds = [1.0, 1.5, 2.0]
+        results = {}
+
+        for th in match_thresholds:
+            # Perform GT–pred assignment with the current matching threshold.
+            # This determines which prediction is associated with which GT box.
+            matched = self.assign_pred_to_gt_vip3d(
+                pred_bbox,
+                gt_bbox,
+                gt_label.clone(),  # clone to avoid in-place modifications
+                match_dis_thresh=th
+            )
+
+            # Compute motion metrics using a fixed FDE threshold of 2.0m.
+            # Only the object-level matching is affected by "th".
+            metrics = self.compute_motion_metric_vip3d(
+                gt_bbox,
+                gt_label.clone(),
+                gt_attr_label,
+                pred_bbox,
+                matched,
+                mapped_class_names,
+                match_dis_thresh=2.0
+            )
+
+            # Store results for this threshold setting.
+            results[f"match_{th}m"] = metrics
+
+            # Print intermediate results for debugging/analysis.
+            # motion_cls_names = ['car', 'pedestrian']
+            # summary_rows = []
+            # for cls in motion_cls_names:
+            #     gt = float(metrics.get(f'gt_{cls}', 0.0))
+            #     hits = float(metrics.get(f'hit_{cls}', 0.0))
+            #     cnt_ade = float(metrics.get(f'cnt_ade_{cls}', 0.0))
+            #     ade = float(metrics.get(f'ADE_{cls}', 0.0)) / cnt_ade if cnt_ade > 0 else 0.0
+            #     cnt_fde = float(metrics.get(f'cnt_fde_{cls}', 0.0))
+            #     fde = float(metrics.get(f'FDE_{cls}', 0.0)) / cnt_fde if cnt_fde > 0 else 0.0
+            #     summary_rows.append(
+            #         f'{cls}: detections={hits:.0f}/{gt:.0f} '
+            #         f'(ADE={ade:.3f}, FDE={fde:.3f})'
+            #     )
+
+            # if summary_rows:
+            #     print(f'[MotionMetric @ match {th}m] ' + ' | '.join(summary_rows))
+            # else:
+            #     print(f'[MotionMetric @ match {th}m] metric_dict is empty')
+
+        return results
 
     ### same planning metric as stp3
     def compute_planner_metric_stp3(
