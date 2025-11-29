@@ -18,6 +18,38 @@ from mmdet3d.core.bbox.box_np_ops import points_cam2img
 from nuscenes.utils.geometry_utils import transform_matrix
 
 
+def _append_scene_suffix(path, num_scenes):
+    base, ext = osp.splitext(path)
+    return f'{base}_scenes{num_scenes}{ext}'
+
+
+def _subsample_infos_by_scene(info_data, num_scenes):
+    allowed_tokens = []
+    token_set = set()
+    filtered_infos = []
+    for info in info_data.get('infos', []):
+        token = info.get('scene_token')
+        if token is None:
+            filtered_infos.append(info)
+            continue
+        if token in token_set:
+            filtered_infos.append(info)
+            continue
+        if len(token_set) < num_scenes:
+            token_set.add(token)
+            allowed_tokens.append(token)
+            filtered_infos.append(info)
+        else:
+            continue
+    new_data = dict(info_data)
+    new_data['infos'] = filtered_infos
+    metadata = dict(new_data.get('metadata', {}))
+    metadata['num_scenes'] = len(token_set)
+    metadata['scene_tokens'] = allowed_tokens
+    new_data['metadata'] = metadata
+    return new_data, len(token_set)
+
+
 nus_categories = ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
                   'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone',
                   'barrier')
@@ -48,7 +80,8 @@ def create_nuscenes_infos(root_path,
                           can_bus_root_path,
                           info_prefix,
                           version='v1.0-trainval',
-                          max_sweeps=10):
+                          max_sweeps=10,
+                          num_scenes=0):
     """Create info file of nuscene dataset.
 
     Given the raw data, generate its related info file in pkl format.
@@ -58,8 +91,9 @@ def create_nuscenes_infos(root_path,
         info_prefix (str): Prefix of the info file to be generated.
         version (str): Version of the data.
             Default: 'v1.0-trainval'
-        max_sweeps (int): Max number of sweeps.
-            Default: 10
+        max_sweeps (int): Max number of sweeps. Default: 10
+        num_scenes (int): If >0, also dump a *_scenesN.pkl containing only
+            the first N training scenes. Default: 0 (disabled).
     """
     from nuscenes.nuscenes import NuScenes
     from nuscenes.can_bus.can_bus_api import NuScenesCanBus
@@ -116,14 +150,22 @@ def create_nuscenes_infos(root_path,
     else:
         print('train sample: {}, val sample: {}'.format(
             len(train_nusc_infos), len(val_nusc_infos)))
-        data = dict(infos=train_nusc_infos, metadata=metadata)
+        train_data = dict(infos=train_nusc_infos, metadata=metadata)
         info_path = osp.join(out_path,
                              '{}_infos_temporal_train.pkl'.format(info_prefix))
-        mmcv.dump(data, info_path)
-        data['infos'] = val_nusc_infos
+        mmcv.dump(train_data, info_path)
+        if num_scenes and num_scenes > 0:
+            limited_data, kept = _subsample_infos_by_scene(train_data, num_scenes)
+            if kept > 0:
+                limited_path = _append_scene_suffix(info_path, kept)
+                mmcv.dump(limited_data, limited_path)
+                print(f'[SceneLimit] Saved {kept} train scenes to {limited_path}')
+            else:
+                print('[SceneLimit] No scenes retained; skipping limited-file dump.')
+        val_data = dict(infos=val_nusc_infos, metadata=metadata)
         info_val_path = osp.join(out_path,
                                  '{}_infos_temporal_val.pkl'.format(info_prefix))
-        mmcv.dump(data, info_val_path)
+        mmcv.dump(val_data, info_val_path)
 
 
 def get_available_scenes(nusc):
@@ -920,7 +962,8 @@ def nuscenes_data_prep(root_path,
                        version,
                        dataset_name,
                        out_dir,
-                       max_sweeps=10):
+                       max_sweeps=10,
+                       num_scenes=0):
     """Prepare data related to nuScenes dataset.
 
     Related data consists of '.pkl' files recording basic infos,
@@ -933,9 +976,16 @@ def nuscenes_data_prep(root_path,
         dataset_name (str): The dataset class name.
         out_dir (str): Output directory of the groundtruth database info.
         max_sweeps (int): Number of input consecutive frames. Default: 10
+        num_scenes (int): Optional limit on number of train scenes; 0 means all.
     """
     create_nuscenes_infos(
-        root_path, out_dir, can_bus_root_path, info_prefix, version=version, max_sweeps=max_sweeps)
+        root_path,
+        out_dir,
+        can_bus_root_path,
+        info_prefix,
+        version=version,
+        max_sweeps=max_sweeps,
+        num_scenes=num_scenes)
 
 
 parser = argparse.ArgumentParser(description='Data converter arg parser')
@@ -971,6 +1021,12 @@ parser.add_argument(
 parser.add_argument('--extra-tag', type=str, default='kitti')
 parser.add_argument(
     '--workers', type=int, default=4, help='number of threads to be used')
+parser.add_argument(
+    '--num-scenes',
+    type=int,
+    default=0,
+    help='If >0, keep only the first N train scenes (val/test untouched) and '
+         'write a *_scenesN.pkl alongside the full file.')
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -983,7 +1039,8 @@ if __name__ == '__main__':
             version=train_version,
             dataset_name='NuScenesDataset',
             out_dir=args.out_dir,
-            max_sweeps=args.max_sweeps)
+            max_sweeps=args.max_sweeps,
+            num_scenes=args.num_scenes)
         test_version = f'{args.version}-test'
         nuscenes_data_prep(
             root_path=args.root_path,
@@ -1002,4 +1059,5 @@ if __name__ == '__main__':
             version=train_version,
             dataset_name='NuScenesDataset',
             out_dir=args.out_dir,
-            max_sweeps=args.max_sweeps)
+            max_sweeps=args.max_sweeps,
+            num_scenes=args.num_scenes)
