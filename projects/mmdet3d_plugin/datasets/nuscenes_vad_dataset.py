@@ -3,6 +3,7 @@ import json
 import copy
 import tempfile
 import csv
+import warnings
 from typing import Dict, List
 
 import numpy as np
@@ -1023,10 +1024,16 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         padding_value=-10000,
         use_pkl_result=False,
         custom_eval_version='vad_nusc_detection_cvpr_2019',
+        num_scenes=0,
+        scene_tokens_file=None,
+        version='v1.0-trainval',
         *args,
         **kwargs
     ):
+        self.num_scenes = num_scenes
+        self.scene_tokens_file = scene_tokens_file
         super().__init__(*args, **kwargs)
+        self.requested_version = version
         self.queue_length = queue_length
         self.overlap_test = overlap_test
         self.bev_size = bev_size
@@ -1056,11 +1063,52 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         self.padding_value = padding_value
         self.fixed_num = map_fixed_ptsnum_per_line
         self.eval_use_same_gt_sample_num_flag = map_eval_use_same_gt_sample_num_flag
-        self.vector_map = VectorizedLocalMap(kwargs['data_root'], 
-                            patch_size=self.patch_size, map_classes=self.MAPCLASSES, 
+        self.vector_map = VectorizedLocalMap(kwargs['data_root'],
+                            patch_size=self.patch_size, map_classes=self.MAPCLASSES,
                             fixed_ptsnum_per_line=map_fixed_ptsnum_per_line,
                             padding_value=self.padding_value)
         self.is_vis_on_test = True
+        if self.num_scenes and self.num_scenes > 0:
+            self._apply_num_scenes()
+
+    def _apply_num_scenes(self):
+        scene_tokens = None
+        if self.scene_tokens_file and osp.exists(self.scene_tokens_file):
+            try:
+                scene_tokens = mmcv.load(self.scene_tokens_file)
+            except Exception:
+                scene_tokens = None
+        if scene_tokens is not None:
+            # keep only tokens that still exist in current dataset
+            valid_set = set(info.get('scene_token') for info in self.data_infos)
+            scene_tokens = [tok for tok in scene_tokens if tok in valid_set]
+            if len(scene_tokens) < self.num_scenes:
+                warnings.warn(
+                    'Stored scene_tokens_file does not have enough valid scenes. '
+                    'Rebuilding the scene token list.')
+                scene_tokens = None
+        if scene_tokens is None:
+            seen = set()
+            scene_tokens = []
+            for info in self.data_infos:
+                token = info.get('scene_token')
+                if token is None or token in seen:
+                    continue
+                seen.add(token)
+                scene_tokens.append(token)
+                if len(scene_tokens) >= self.num_scenes:
+                    break
+            if self.scene_tokens_file:
+                dir_name = osp.dirname(self.scene_tokens_file)
+                if dir_name:
+                    mmcv.mkdir_or_exist(dir_name)
+                mmcv.dump(scene_tokens, self.scene_tokens_file)
+        allowed = set(scene_tokens[:self.num_scenes])
+        filtered_infos = [
+            info for info in self.data_infos
+            if info.get('scene_token') in allowed
+        ]
+        self.data_infos = filtered_infos
 
     def _print_detection_summary(self, detection_results):
         prefix = 'pts_bbox_NuScenes'
@@ -1729,7 +1777,22 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         # record metrics
         metrics = mmcv.load(osp.join(output_dir, 'metrics_summary.json'))
         metric_prefix = f'{result_name}_NuScenes'
+
+        det_table = PrettyTable()
+        det_table.field_names = ['Class', 'AP', 'ATE', 'ASE', 'AOE', 'AVE', 'AAE']
         for name in self.CLASSES:
+            ap_values = list(metrics['label_aps'][name].values())
+            ap_mean = sum(ap_values) / len(ap_values) if ap_values else 0.0
+            tp_err = metrics['label_tp_errors'][name]
+            det_table.add_row([
+                name,
+                f'{ap_mean:.3f}',
+                f'{tp_err["trans_err"]:.3f}',
+                f'{tp_err["scale_err"]:.3f}',
+                f'{tp_err["orient_err"]:.3f}',
+                f'{tp_err["vel_err"]:.3f}' if not np.isnan(tp_err["vel_err"]) else 'nan',
+                f'{tp_err["attr_err"]:.3f}' if not np.isnan(tp_err["attr_err"]) else 'nan',
+            ])
             for k, v in metrics['label_aps'][name].items():
                 val = float('{:.4f}'.format(v))
                 detail['{}/{}_AP_dist_{}'.format(metric_prefix, name, k)] = val
@@ -1740,6 +1803,11 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                 val = float('{:.4f}'.format(v))
                 detail['{}/{}'.format(metric_prefix,
                                       self.ErrNameMapping[k])] = val
+
+        print('\n' + '=' * 72)
+        print('Detection'.center(72))
+        print('=' * 72)
+        print(det_table)
         detail['{}/NDS'.format(metric_prefix)] = metrics['nd_score']
         detail['{}/mAP'.format(metric_prefix)] = metrics['mean_ap']
 
@@ -1765,10 +1833,11 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         for metric in map_metrics:
             if metric not in allowed_metrics:
                 raise KeyError(f'metric {metric} is not supported')
+
+        print('\n' + '=' * 70)
+        print(f'Map Prediction'.center(70))
+        print('=' * 70)
         for metric in map_metrics:
-            print('\n' + '=' * 70)
-            print(f'Map Metric Summary ({metric})'.center(70))
-            print('=' * 70)
             if metric == 'chamfer':
                 thresholds = [0.5,1.0,1.5]
             elif metric == 'iou':
@@ -1810,6 +1879,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
 
         return detail
 
+
     def evaluate(self,
                  results,
                  metric='bbox',
@@ -1840,230 +1910,190 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         Returns:
             dict[str, float]: Results of each evaluation metric.
         """
-        summary_root = jsonfile_prefix if jsonfile_prefix is not None else osp.join('test', 'eval_summaries')
-        summary_dir = osp.join(summary_root, 'summaries')
-        mmcv.mkdir_or_exist(summary_dir)
-        summary_paths = []
-        log_messages = []
-
-        result_metric_names = ['EPA', 'MR']
+        result_metric_names = ['EPA', 'ADE', 'FDE', 'MR']
         motion_cls_names = ['car', 'pedestrian']
-        distance_thresholds = getattr(self, 'distance_thresholds', [1.0, 1.5, 2.0])
-
-        motion_summary_rows = []
-        motion_threshold_rows = []
-        planning_rows = []
-        map_class_rows = []
-        map_threshold_rows = []
-        map_overview_rows = []
-
-        # Initialize dictionaries for aggregating metrics
-        all_metric_dict = {}
-
-        # Basic metrics without thresholds
-        for met in ['gt', 'hit', 'fp', 'MR']:
-            for cls in motion_cls_names:
-                all_metric_dict[met+'_'+cls] = 0.0
-
-        # ADE/FDE metrics for each distance threshold
-        for thresh in distance_thresholds:
-            thresh_label = format_distance_label(thresh)
-            for cls in motion_cls_names:
-                all_metric_dict[f'cnt_ade_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'cnt_fde_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'ADE_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'FDE_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'gt_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'fp_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'hit_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'MR_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'gt_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'fp_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'hit_{thresh_label}_{cls}'] = 0.0
-                all_metric_dict[f'MR_{thresh_label}_{cls}'] = 0.0
-
-        result_dict = {}
-
+        motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
+                               'fp', 'ADE', 'FDE', 'MR']
         alpha = 0.5
 
-        # Aggregate metrics from all results
-        for i in range(len(results)):
-            for key in all_metric_dict.keys():
-                if key in results[i]['metric_results']:
-                    all_metric_dict[key] += results[i]['metric_results'][key]
-
-        # Compute final metrics
-        for cls in motion_cls_names:
-            # EPA and MR remain the same
-            result_dict['EPA_'+cls] = (all_metric_dict['hit_'+cls] - \
-                 alpha * all_metric_dict['fp_'+cls]) / all_metric_dict['gt_'+cls]
-            result_dict['MR_'+cls] = all_metric_dict['MR_'+cls] / all_metric_dict['gt_'+cls]
-
-            # Compute ADE and FDE for each distance threshold
-            for thresh in distance_thresholds:
-                thresh_label = format_distance_label(thresh)
-                cnt_ade_key = f'cnt_ade_{thresh_label}_{cls}'
-                cnt_fde_key = f'cnt_fde_{thresh_label}_{cls}'
-
-                if all_metric_dict[cnt_ade_key] > 0:
-                    result_dict[f'ADE_{thresh_label}_{cls}'] = \
-                        all_metric_dict[f'ADE_{thresh_label}_{cls}'] / all_metric_dict[cnt_ade_key]
+        def parse_motion_key(key):
+            parts = key.split('_')
+            if len(parts) < 2:
+                return None
+            cls = parts[-1]
+            if cls not in motion_cls_names:
+                return None
+            metric_body = '_'.join(parts[:-1])
+            threshold = None
+            if '_' in metric_body:
+                base, suffix = metric_body.rsplit('_', 1)
+                if suffix.endswith('m'):
+                    metric_name = base
+                    threshold = suffix
                 else:
-                    result_dict[f'ADE_{thresh_label}_{cls}'] = 0.0
-
-                if all_metric_dict[cnt_fde_key] > 0:
-                    result_dict[f'FDE_{thresh_label}_{cls}'] = \
-                        all_metric_dict[f'FDE_{thresh_label}_{cls}'] / all_metric_dict[cnt_fde_key]
-                else:
-                    result_dict[f'FDE_{thresh_label}_{cls}'] = 0.0
-
-        header_width = 50
-        motion_header = ' Motion Prediction '.center(header_width, '-')
-        log_messages.append(f'\n{motion_header}')
-        for metric in ['EPA', 'MR']:
-            row = {'Metric': metric}
-            for cls in motion_cls_names:
-                row[cls] = result_dict[f'{metric}_{cls}']
-            motion_summary_rows.append(row)
-
-        if PrettyTable:
-            summary_table = PrettyTable()
-            summary_table.field_names = ['Metric'] + motion_cls_names
-            for row in motion_summary_rows:
-                summary_table.add_row([row['Metric']] + [f'{row[cls]:.4f}' for cls in motion_cls_names])
-            log_messages.append(summary_table.get_string())
-        else:
-            log_messages.append('EPA and MR:')
-            for row in motion_summary_rows:
-                metric = row['Metric']
-                for cls in motion_cls_names:
-                    log_messages.append(f'  {metric}_{cls}: {row[cls]:.4f}')
-
-        log_messages.append('\nADE/FDE/EPA/MR by distance threshold:')
-        for thresh in distance_thresholds:
-            thresh_label = format_distance_label(thresh)
-            banner = f' Threshold {thresh_label} '.center(50, '-')
-            log_messages.append(f'\n{banner}')
-            log_messages.append('Class-wise metrics:')
-            thresh_rows = []
-            for cls in motion_cls_names:
-                ade_val = result_dict[f'ADE_{thresh_label}_{cls}']
-                fde_val = result_dict[f'FDE_{thresh_label}_{cls}']
-                hit_val = all_metric_dict[f'hit_{thresh_label}_{cls}']
-                fp_val = all_metric_dict[f'fp_{thresh_label}_{cls}']
-                gt_val = all_metric_dict[f'gt_{thresh_label}_{cls}']
-                mr_cnt = all_metric_dict[f'MR_{thresh_label}_{cls}']
-                if gt_val > 0:
-                    epa_val = (hit_val - alpha * fp_val) / gt_val
-                    mr_val = mr_cnt / gt_val
-                else:
-                    epa_val = 0.0
-                    mr_val = 0.0
-                motion_threshold_rows.append({
-                    'Threshold': thresh_label,
-                    'Class': cls,
-                    'ADE': ade_val,
-                    'FDE': fde_val,
-                    'EPA': epa_val,
-                    'MR': mr_val
-                })
-                thresh_rows.append((cls, ade_val, fde_val, epa_val, mr_val))
-            if PrettyTable:
-                thresh_table = PrettyTable()
-                thresh_table.field_names = ['Class', 'ADE', 'FDE', 'EPA', 'MR']
-                for cls, ade_val, fde_val, epa_val, mr_val in thresh_rows:
-                    thresh_table.add_row([
-                        cls, f'{ade_val:.4f}', f'{fde_val:.4f}',
-                        f'{epa_val:.4f}', f'{mr_val:.4f}'
-                    ])
-                log_messages.append(thresh_table.get_string())
+                    metric_name = metric_body
             else:
-                for cls, ade_val, fde_val, epa_val, mr_val in thresh_rows:
-                    log_messages.append(f'    ADE_{thresh_label}_{cls}: {ade_val:.4f}')
-                    log_messages.append(f'    FDE_{thresh_label}_{cls}: {fde_val:.4f}')
-                    log_messages.append(f'    EPA_{thresh_label}_{cls}: {epa_val:.4f}')
-                    log_messages.append(f'    MR_{thresh_label}_{cls}: {mr_val:.4f}')
+                metric_name = metric_body
+            if metric_name not in motion_metric_names:
+                return None
+            return metric_name, threshold, cls
+
+        aggregated_sections = {}
+
+        def add_metric(threshold, metric, cls, value):
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            if not isinstance(value, (int, float)):
+                return
+            section = aggregated_sections.setdefault(threshold, {})
+            section.setdefault(metric, {}).setdefault(cls, 0.0)
+            section[metric][cls] += float(value)
+
+        for res in results:
+            metric_results = res.get('metric_results', {})
+            for key, value in metric_results.items():
+                if isinstance(value, dict) and key.startswith('match_'):
+                    threshold = key.replace('match_', '', 1)
+                    for inner_key, inner_val in value.items():
+                        parsed = parse_motion_key(inner_key)
+                        if not parsed:
+                            continue
+                        metric_name, _, cls = parsed
+                        add_metric(threshold, metric_name, cls, inner_val)
+                else:
+                    parsed = parse_motion_key(key)
+                    if not parsed:
+                        continue
+                    metric_name, threshold, cls = parsed
+                    add_metric(threshold, metric_name, cls, value)
+
+        def sorted_thresholds(keys):
+            def sort_key(k):
+                if k is None:
+                    return (-1, 0.0)
+                label = k.rstrip('m')
+                try:
+                    return (0, float(label))
+                except ValueError:
+                    return (0, k)
+            return sorted(keys, key=sort_key)
+
+        section_order = sorted_thresholds(aggregated_sections.keys())
+        aggregated_results = {}
+
+        print('\n' + '=' * 70)
+        print('Motion Prediction'.center(70))
+        print('=' * 70)
+
+        for threshold in section_order:
+            metrics_map = aggregated_sections.get(threshold, {})
+            section_result = {}
+            label_suffix = '' if threshold is None else f'_{threshold}'
+            section_label = 'Overall (2.0m)' if threshold is None else f'Threshold {threshold}'
+            print(section_label.center(70))
+            for cls in motion_cls_names:
+                gt_sum = metrics_map.get('gt', {}).get(cls, 0.0)
+                hit_sum = metrics_map.get('hit', {}).get(cls, 0.0)
+                fp_sum = metrics_map.get('fp', {}).get(cls, 0.0)
+                mr_sum = metrics_map.get('MR', {}).get(cls, 0.0)
+                cnt_ade = metrics_map.get('cnt_ade', {}).get(cls, 0.0)
+                sum_ade = metrics_map.get('ADE', {}).get(cls, 0.0)
+                cnt_fde = metrics_map.get('cnt_fde', {}).get(cls, 0.0)
+                sum_fde = metrics_map.get('FDE', {}).get(cls, 0.0)
+
+                if gt_sum > 0:
+                    section_result[f'EPA{label_suffix}_{cls}'] = (hit_sum - alpha * fp_sum) / gt_sum
+                else:
+                    section_result[f'EPA{label_suffix}_{cls}'] = 0.0
+
+                if cnt_ade > 0:
+                    section_result[f'ADE{label_suffix}_{cls}'] = sum_ade / cnt_ade
+                else:
+                    section_result[f'ADE{label_suffix}_{cls}'] = 0.0
+
+                if cnt_fde > 0:
+                    section_result[f'FDE{label_suffix}_{cls}'] = sum_fde / cnt_fde
+                    section_result[f'MR{label_suffix}_{cls}'] = mr_sum / cnt_fde
+                else:
+                    section_result[f'FDE{label_suffix}_{cls}'] = 0.0
+                    section_result[f'MR{label_suffix}_{cls}'] = 0.0
+
+            if PrettyTable:
+                table = PrettyTable()
+                table.field_names = ['Metric'] + motion_cls_names
+                for metric in result_metric_names:
+                    row = [metric]
+                    for cls in motion_cls_names:
+                        key = f'{metric}{label_suffix}_{cls}'
+                        row.append(f'{section_result.get(key, 0.0):.4f}')
+                    table.add_row(row)
+                print(table)
+            else:
+                for metric in result_metric_names:
+                    for cls in motion_cls_names:
+                        key = f'{metric}{label_suffix}_{cls}'
+                        value = section_result.get(key, 0.0)
+                        print(f'{key}: {value:.4f}')
+
+            aggregated_results.update(section_result)
+
+        if not aggregated_results:
+            print('\nNo motion metrics found in results.')
 
         # NOTE: print planning metric
-        log_messages.append('\n-------------- Planning --------------')
-        metric_dict = None
+        print('\n' + '=' * 70)
+        print('Planning'.center(70))
+        print('=' * 70)
+        metric_dict = {}
         num_valid = 0
         for res in results:
             if res['metric_results']['fut_valid_flag']:
                 num_valid += 1
             else:
                 continue
-            if metric_dict is None:
-                metric_dict = copy.deepcopy(res['metric_results'])
-            else:
-                for k in res['metric_results'].keys():
-                    metric_dict[k] += res['metric_results'][k]
+            for k, v in res['metric_results'].items():
+                if not (k.startswith('plan_') or k == 'fut_valid_flag'):
+                    continue
+                if isinstance(v, dict):
+                    continue
+                metric_dict[k] = metric_dict.get(k, 0.0) + float(v)
 
-        planning_keys = []
-        for k in metric_dict:
-            metric_dict[k] = metric_dict[k] / num_valid
-            if k.startswith('plan_') or k == 'fut_valid_flag':
-                planning_rows.append({'Metric': k, 'Value': metric_dict[k]})
-                planning_keys.append(k)
-
-        if PrettyTable:
-            planning_table = PrettyTable()
-            planning_table.field_names = ['Metric', 'Value']
-            for key in sorted(planning_keys):
-                planning_table.add_row([key, f'{metric_dict[key]:.4f}'])
-            log_messages.append(planning_table.get_string())
+        if num_valid > 0:
+            for k in metric_dict:
+                metric_dict[k] = metric_dict[k] / num_valid
+            horizons = ['1s', '2s', '3s']
+            plan_table = PrettyTable()
+            plan_table.field_names = ['Horizon', 'L2', 'Obj Col', 'Obj Box Col']
+            for idx, hz in enumerate(horizons, 1):
+                plan_table.add_row([
+                    hz,
+                    f'{metric_dict.get(f"plan_L2_{idx}s", 0.0):.4f}',
+                    f'{metric_dict.get(f"plan_obj_col_{idx}s", 0.0):.4f}',
+                    f'{metric_dict.get(f"plan_obj_box_col_{idx}s", 0.0):.4f}',
+                ])
+            print(plan_table)
+            if 'fut_valid_flag' in metric_dict:
+                print(f'fut_valid_flag: {metric_dict["fut_valid_flag"]:.1f}')
         else:
-            for key in sorted(planning_keys):
-                log_messages.append("{}:{}".format(key, metric_dict[key]))
-
-        combined_results = dict(result_dict)
-        combined_results.update(metric_dict)
+            print('No valid planning metrics to summarize.')
 
         result_files, tmp_dir = self.format_results(results, jsonfile_prefix)
 
         if isinstance(result_files, dict):
-            detection_results = dict()
+            results_dict = dict()
             for name in result_names:
                 print('Evaluating bboxes of {}'.format(name))
                 ret_dict = self._evaluate_single(result_files[name], metric=metric, map_metric=map_metric)
-            detection_results.update(ret_dict)
+            results_dict.update(ret_dict)
         elif isinstance(result_files, str):
-            detection_results = self._evaluate_single(result_files, metric=metric, map_metric=map_metric)
+            results_dict = self._evaluate_single(result_files, metric=metric, map_metric=map_metric)
 
         if tmp_dir is not None:
             tmp_dir.cleanup()
 
         if show:
             self.show(results, out_dir, pipeline=pipeline)
-        combined_results.update(detection_results)
-
-        if detection_results:
-            self._print_detection_summary(detection_results)
-
-        motion_csv = osp.join(summary_dir, 'motion_overall.csv')
-        if _write_csv(motion_csv, ['Metric'] + motion_cls_names, motion_summary_rows):
-            summary_paths.append(motion_csv)
-        motion_thresh_csv = osp.join(summary_dir, 'motion_thresholds.csv')
-        if _write_csv(motion_thresh_csv, ['Threshold', 'Class', 'ADE', 'FDE', 'EPA', 'MR'], motion_threshold_rows):
-            summary_paths.append(motion_thresh_csv)
-        planning_csv = osp.join(summary_dir, 'planning_metrics.csv')
-        if _write_csv(planning_csv, ['Metric', 'Value'], planning_rows):
-            summary_paths.append(planning_csv)
-        detection_csv = osp.join(summary_dir, 'detection_metrics.csv')
-        detection_rows = [{'Metric': k, 'Value': v} for k, v in detection_results.items()]
-        if _write_csv(detection_csv, ['Metric', 'Value'], detection_rows):
-            summary_paths.append(detection_csv)
-
-        if summary_paths:
-            print('\nSaved summary tables:')
-            for path in summary_paths:
-                print(f'  - {path}')
-        self.latest_summary_paths = summary_paths
-
-        for msg in log_messages:
-            print(msg)
-
-        return combined_results
+        return results_dict
 
 def output_to_nusc_box(detection):
     """Convert the output to the box class in the nuScenes.
