@@ -2,27 +2,26 @@ _base_ = [
     '../datasets/custom_nus-3d.py',
     '../_base_/default_runtime.py'
 ]
-#
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
-# If point cloud range is changed, the models should also change their point
-# cloud range accordingly
+# ===== Dataset / Geometry settings =====
+# Spatial coverage of each sample [xmin, ymin, zmin, xmax, ymax, zmax]
 point_cloud_range = [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0]
+# Voxel resolution used in BEV pipeline
 voxel_size = [0.15, 0.15, 4]
 
-# img_norm_cfg = dict(
-#     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+# Input normalization for multiview images
 img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
-# For nuScenes we usually do 10-class detection
+# Detection classes (nuScenes 10-class split)
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 num_classes = len(class_names)
 
-# map has classes: divider, ped_crossing, boundary
+# Vectorized map classes + settings
 map_classes = ['divider', 'ped_crossing', 'boundary']
 map_num_vec = 100
 map_fixed_ptsnum_per_gt_line = 20 # now only support fixed_pts > 0
@@ -30,12 +29,37 @@ map_fixed_ptsnum_per_pred_line = 20
 map_eval_use_same_gt_sample_num_flag = True
 map_num_classes = len(map_classes)
 
+# Sensor modalities used in the dataset
 input_modality = dict(
     use_lidar=False,
     use_camera=True,
     use_radar=False,
     use_map=False,
     use_external=True)
+# ======================================
+
+# ===== Training hyperparameters =====
+# Number of frames per sample (history queue length)
+queue_length = 4
+# Total number of training epochs
+total_epochs = 60
+# Training scene subsampling (0 = use all scenes)
+num_train_scenes = 0
+# Whether to freeze image/pts backbones
+freeze_backbone = True
+# Pretrained checkpoint path for image backbone
+pretrained_ckpt = 'ckpts/resnet50-19c8e357.pth'
+# Optimizer learning rate & schedule
+base_lr = 2e-4
+weight_decay = 0.01
+backbone_lr_mult = 0.1
+grad_clip_norm = 35
+warmup_iters = 500
+warmup_ratio = 1.0 / 3
+min_lr_ratio = 1e-3
+# Logging interval for Text/TensorBoard/WandB
+log_interval = 10
+# ===================================
 
 _dim_ = 256
 _pos_dim_ = _dim_//2
@@ -43,23 +67,20 @@ _ffn_dim_ = _dim_*2
 _num_levels_ = 4
 bev_h_ = 200
 bev_w_ = 200
-queue_length = 4 # each sequence contains `queue_length` frames.
-total_epochs = 60
 
 experiment = dict(
     name='VAD_base_e2e',
     project='VAD',
     use_timestamp=True,
-    tags=['baseline'])
-
-num_train_scenes = 100  # set >0 to subsample training scenes
+    tags=['baseline']
+)
 
 model = dict(
     type='VAD',
     use_grid_mask=True,
     video_test_mode=True,
-    # pretrained=dict(img='torchvision://resnet50'),
-    pretrained=dict(img='ckpts/resnet50-19c8e357.pth'),
+    pretrained=dict(img=pretrained_ckpt),
+    freeze_backbone=freeze_backbone,
     img_backbone=dict(
         type='ResNet',
         depth=50,
@@ -420,21 +441,21 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=2e-4,
+    lr=base_lr,
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.1),
+            'img_backbone': dict(lr_mult=backbone_lr_mult),
         }),
-    weight_decay=0.01)
+    weight_decay=weight_decay)
 
-optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(grad_clip=dict(max_norm=grad_clip_norm, norm_type=2))
 # learning policy
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=500,
-    warmup_ratio=1.0 / 3,
-    min_lr_ratio=1e-3)
+    warmup_iters=warmup_iters,
+    warmup_ratio=warmup_ratio,
+    min_lr_ratio=min_lr_ratio)
 
 evaluation = dict(interval=total_epochs, pipeline=test_pipeline, metric='bbox', map_metric='chamfer')
 
@@ -449,7 +470,7 @@ if experiment.get('notes'):
     wandb_init_kwargs['notes'] = experiment['notes']
 
 log_config = dict(
-    interval=10,
+    interval=log_interval,
     hooks=[
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
