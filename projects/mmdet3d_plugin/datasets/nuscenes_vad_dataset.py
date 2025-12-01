@@ -1027,6 +1027,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         num_scenes=0,
         scene_tokens_file=None,
         version='v1.0-trainval',
+        hard_sample=False,
         *args,
         **kwargs
     ):
@@ -1070,6 +1071,28 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         self.is_vis_on_test = True
         if self.num_scenes and self.num_scenes > 0:
             self._apply_num_scenes()
+
+        if hard_sample:
+            # hard_sample_pkl = '/home/geonyeong/park_ws/2025.HYUNDAI.E2E.VAD/data/infos/nuscenes_infos_val_hard_planning_scene.pkl' # T-nuscenes
+            hard_sample_pkl = '/home/work/song99/VAD/val_infos_turn_ego.pkl' # revised T-nuscenes
+            print(f"[VADDataset] hard_sample_pkl arg={hard_sample_pkl}")
+            sample_data = mmcv.load(hard_sample_pkl)
+            if isinstance(sample_data, dict):
+                if 'sample_tokens' in sample_data:
+                    sample_tokens = sample_data['sample_tokens']
+                elif 'infos' in sample_data:
+                    sample_tokens = [info['token'] for info in sample_data['infos']]
+                else:
+                    sample_tokens = list(sample_data.keys())
+            else:
+                sample_tokens = sample_data
+            self.hard_sample_tokens = set(sample_tokens)
+            print(f'[VADDataset] Loaded {len(self.hard_sample_tokens)} hard samples from {hard_sample_pkl}')
+            print(f"[VADDataset] Before filtering len(data_infos) = {len(self.data_infos)}")
+            filtered_infos = [info for info in self.data_infos
+                            if info['token'] in self.hard_sample_tokens]
+            print(f"[VADDataset] After filtering len(data_infos) = {len(filtered_infos)}")
+            self.data_infos = filtered_infos
 
     def _apply_num_scenes(self):
         scene_tokens = None
@@ -1845,7 +1868,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             cls_aps = np.zeros((len(thresholds),self.NUM_MAPCLASSES))
             for i, thr in enumerate(thresholds):
                 # print('\n' + f' Threshold {thr} '.center(50, '-'))
-                print('\n' + '-' * 70)
+                print('-' * 70)
                 print(f"Threshold: {thr:.2f}".center(70))
                 print('-' * 70)
                 mAP, cls_ap = eval_map(
@@ -1913,7 +1936,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         Returns:
             dict[str, float]: Results of each evaluation metric.
         """
-        result_metric_names = ['EPA', 'ADE', 'FDE', 'MR']
+        result_metric_names = ['ADE', 'FDE', 'MR', 'EPA']
         motion_cls_names = ['car', 'pedestrian']
         motion_metric_names = ['gt', 'cnt_ade', 'cnt_fde', 'hit',
                                'fp', 'ADE', 'FDE', 'MR']
@@ -1994,10 +2017,13 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             label_suffix = '' if threshold is None else f'_{threshold}'
             section_label = 'Overall (2.0m)' if threshold is None else f'Threshold: {threshold}'
             # print(section_label.center(70))
-            print('\n' + '-' * 70)
+            print('-' * 70)
             # print(f"Threshold: {thr:.2f}".center(70))
             print(section_label.center(70))
             print('-' * 70)
+            total_gt = total_hit = total_fp = total_cnt_ade = total_sum_ade = 0.0
+            total_cnt_fde = total_sum_fde = total_mr_sum = 0.0
+
             for cls in motion_cls_names:
                 gt_sum = metrics_map.get('gt', {}).get(cls, 0.0)
                 hit_sum = metrics_map.get('hit', {}).get(cls, 0.0)
@@ -2025,19 +2051,46 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                     section_result[f'FDE{label_suffix}_{cls}'] = 0.0
                     section_result[f'MR{label_suffix}_{cls}'] = 0.0
 
+                total_gt += gt_sum
+                total_hit += hit_sum
+                total_fp += fp_sum
+                total_cnt_ade += cnt_ade
+                total_sum_ade += sum_ade
+                total_cnt_fde += cnt_fde
+                total_sum_fde += sum_fde
+                total_mr_sum += mr_sum
+
+            overall_label = 'overall'
+            if total_gt > 0:
+                section_result[f'EPA{label_suffix}_{overall_label}'] = (total_hit - alpha * total_fp) / total_gt
+            else:
+                section_result[f'EPA{label_suffix}_{overall_label}'] = 0.0
+
+            if total_cnt_ade > 0:
+                section_result[f'ADE{label_suffix}_{overall_label}'] = total_sum_ade / total_cnt_ade
+            else:
+                section_result[f'ADE{label_suffix}_{overall_label}'] = 0.0
+
+            if total_cnt_fde > 0:
+                section_result[f'FDE{label_suffix}_{overall_label}'] = total_sum_fde / total_cnt_fde
+                section_result[f'MR{label_suffix}_{overall_label}'] = total_mr_sum / total_cnt_fde
+            else:
+                section_result[f'FDE{label_suffix}_{overall_label}'] = 0.0
+                section_result[f'MR{label_suffix}_{overall_label}'] = 0.0
+
             if PrettyTable:
                 table = PrettyTable()
-                table.field_names = ['Metric'] + motion_cls_names
+                table.field_names = ['Metric'] + motion_cls_names + ['Overall']
                 for metric in result_metric_names:
                     row = [metric]
-                    for cls in motion_cls_names:
+                    for cls in motion_cls_names + [overall_label]:
                         key = f'{metric}{label_suffix}_{cls}'
                         row.append(f'{section_result.get(key, 0.0):.4f}')
                     table.add_row(row)
                 print(table)
             else:
                 for metric in result_metric_names:
-                    for cls in motion_cls_names:
+                    for cls in motion_cls_names + [overall_label]:
                         key = f'{metric}{label_suffix}_{cls}'
                         value = section_result.get(key, 0.0)
                         print(f'{key}: {value:.4f}')
