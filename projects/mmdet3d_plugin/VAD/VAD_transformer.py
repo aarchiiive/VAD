@@ -145,9 +145,13 @@ class VADPerceptionTransformer(BaseModule):
                  rotate_center=[100, 100],
                  map_num_vec=50,
                  map_num_pts_per_vec=10,
+                 pred_map_only=False,
                  **kwargs):
         super(VADPerceptionTransformer, self).__init__(**kwargs)
+        self.pred_map_only = pred_map_only
         self.encoder = build_transformer_layer_sequence(encoder)
+        if self.pred_map_only:
+            decoder = None
         if decoder is not None:
             self.decoder = build_transformer_layer_sequence(decoder)
         else:
@@ -178,7 +182,10 @@ class VADPerceptionTransformer(BaseModule):
             self.num_feature_levels, self.embed_dims))
         self.cams_embeds = nn.Parameter(
             torch.Tensor(self.num_cams, self.embed_dims))
-        self.reference_points = nn.Linear(self.embed_dims, 3)
+        if not self.pred_map_only:
+            self.reference_points = nn.Linear(self.embed_dims, 3)
+        else:
+            self.reference_points = None
         self.map_reference_points = nn.Linear(self.embed_dims, 2)
         self.can_bus_mlp = nn.Sequential(
             nn.Linear(18, self.embed_dims // 2),
@@ -203,7 +210,8 @@ class VADPerceptionTransformer(BaseModule):
                     m.init_weights()
         normal_(self.level_embeds)
         normal_(self.cams_embeds)
-        xavier_init(self.reference_points, distribution='uniform', bias=0.)
+        if self.reference_points is not None:
+            xavier_init(self.reference_points, distribution='uniform', bias=0.)
         xavier_init(self.map_reference_points, distribution='uniform', bias=0.)
         xavier_init(self.can_bus_mlp, distribution='uniform', bias=0.)
 
@@ -377,14 +385,19 @@ class VADPerceptionTransformer(BaseModule):
             prev_bev=prev_bev,
             **kwargs)  # bev_embed shape: bs, bev_h*bev_w, embed_dims
 
+        inter_states = None
+        init_reference_out = None
+        inter_references_out = None
+
         bs = mlvl_feats[0].size(0)
-        query_pos, query = torch.split(
-            object_query_embed, self.embed_dims, dim=1)
-        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
-        query = query.unsqueeze(0).expand(bs, -1, -1)
-        reference_points = self.reference_points(query_pos)
-        reference_points = reference_points.sigmoid()
-        init_reference_out = reference_points
+        if (not self.pred_map_only) and (object_query_embed is not None):
+            query_pos, query = torch.split(
+                object_query_embed, self.embed_dims, dim=1)
+            query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
+            query = query.unsqueeze(0).expand(bs, -1, -1)
+            reference_points = self.reference_points(query_pos)
+            reference_points = reference_points.sigmoid()
+            init_reference_out = reference_points
 
         map_query_pos, map_query = torch.split(
             map_query_embed, self.embed_dims, dim=1)
@@ -394,13 +407,14 @@ class VADPerceptionTransformer(BaseModule):
         map_reference_points = map_reference_points.sigmoid()
         map_init_reference_out = map_reference_points
 
-        query = query.permute(1, 0, 2)
-        query_pos = query_pos.permute(1, 0, 2)
+        if (not self.pred_map_only) and (object_query_embed is not None):
+            query = query.permute(1, 0, 2)
+            query_pos = query_pos.permute(1, 0, 2)
         map_query = map_query.permute(1, 0, 2)
         map_query_pos = map_query_pos.permute(1, 0, 2)
         bev_embed = bev_embed.permute(1, 0, 2)
 
-        if self.decoder is not None:
+        if (not self.pred_map_only) and (self.decoder is not None) and (object_query_embed is not None):
             # [L, Q, B, D], [L, B, Q, D]
             inter_states, inter_references = self.decoder(
                 query=query,
@@ -414,7 +428,7 @@ class VADPerceptionTransformer(BaseModule):
                 level_start_index=torch.tensor([0], device=query.device),
                 **kwargs)
             inter_references_out = inter_references
-        else:
+        elif (not self.pred_map_only) and (object_query_embed is not None):
             inter_states = query.unsqueeze(0)
             inter_references_out = reference_points.unsqueeze(0)
 

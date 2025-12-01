@@ -16,29 +16,31 @@ from projects.mmdet3d_plugin.VAD.planner.metric_stp3 import PlanningMetric
 class VAD(MVXTwoStageDetector):
     """VAD model.
     """
-    def __init__(self,
-                 use_grid_mask=False,
-                 pts_voxel_layer=None,
-                 pts_voxel_encoder=None,
-                 pts_middle_encoder=None,
-                 pts_fusion_layer=None,
-                 img_backbone=None,
-                 pts_backbone=None,
-                 img_neck=None,
-                 pts_neck=None,
-                 pts_bbox_head=None,
-                 img_roi_head=None,
-                 img_rpn_head=None,
-                 train_cfg=None,
-                 test_cfg=None,
-                 pretrained=None,
-                 video_test_mode=False,
-                 fut_ts=6,
-                 fut_mode=6,
-                 class_names=None,
-                 motion_class_groups=None,
-                 freeze_backbone=False
-                 ):
+    def __init__(
+        self,
+        use_grid_mask=False,
+        pts_voxel_layer=None,
+        pts_voxel_encoder=None,
+        pts_middle_encoder=None,
+        pts_fusion_layer=None,
+        img_backbone=None,
+        pts_backbone=None,
+        img_neck=None,
+        pts_neck=None,
+        pts_bbox_head=None,
+        img_roi_head=None,
+        img_rpn_head=None,
+        train_cfg=None,
+        test_cfg=None,
+        pretrained=None,
+        video_test_mode=False,
+        fut_ts=6,
+        fut_mode=6,
+        class_names=None,
+        motion_class_groups=None,
+        freeze_backbone=False,
+        pred_map_only=False,
+    ):
 
         super(VAD,
               self).__init__(pts_voxel_layer, pts_voxel_encoder,
@@ -53,6 +55,8 @@ class VAD(MVXTwoStageDetector):
         self.fut_ts = fut_ts
         self.fut_mode = fut_mode
         self.valid_fut_ts = pts_bbox_head['valid_fut_ts']
+        self.pred_map_only = pred_map_only
+
         if freeze_backbone:
             for name, param in self.named_parameters():
                 if 'img_backbone' in name or 'pts_backbone' in name:
@@ -149,22 +153,24 @@ class VAD(MVXTwoStageDetector):
 
         return img_feats
 
-    def forward_pts_train(self,
-                          pts_feats,
-                          gt_bboxes_3d,
-                          gt_labels_3d,
-                          map_gt_bboxes_3d,
-                          map_gt_labels_3d,
-                          img_metas,
-                          gt_bboxes_ignore=None,
-                          map_gt_bboxes_ignore=None,
-                          prev_bev=None,
-                          ego_his_trajs=None,
-                          ego_fut_trajs=None,
-                          ego_fut_masks=None,
-                          ego_fut_cmd=None,
-                          ego_lcf_feat=None,
-                          gt_attr_labels=None):
+    def forward_pts_train(
+        self,
+        pts_feats,
+        gt_bboxes_3d,
+        gt_labels_3d,
+        map_gt_bboxes_3d,
+        map_gt_labels_3d,
+        img_metas,
+        gt_bboxes_ignore=None,
+        map_gt_bboxes_ignore=None,
+        prev_bev=None,
+        ego_his_trajs=None,
+        ego_fut_trajs=None,
+        ego_fut_masks=None,
+        ego_fut_cmd=None,
+        ego_lcf_feat=None,
+        gt_attr_labels=None
+    ):
         """Forward function'
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -180,8 +186,14 @@ class VAD(MVXTwoStageDetector):
             dict: Losses of each branch.
         """
 
-        outs = self.pts_bbox_head(pts_feats, img_metas, prev_bev,
-                                  ego_his_trajs=ego_his_trajs, ego_lcf_feat=ego_lcf_feat)
+        outs = self.pts_bbox_head(
+            pts_feats,
+            img_metas,
+            prev_bev,
+            ego_his_trajs=ego_his_trajs,
+            ego_lcf_feat=ego_lcf_feat,
+            pred_map_only=self.pred_map_only
+        )
         loss_inputs = [
             gt_bboxes_3d, gt_labels_3d, map_gt_bboxes_3d, map_gt_labels_3d,
             outs, ego_fut_trajs, ego_fut_masks, ego_fut_cmd, gt_attr_labels
@@ -229,28 +241,29 @@ class VAD(MVXTwoStageDetector):
 
     # @auto_fp16(apply_to=('img', 'points'))
     @force_fp32(apply_to=('img','points','prev_bev'))
-    def forward_train(self,
-                      points=None,
-                      img_metas=None,
-                      gt_bboxes_3d=None,
-                      gt_labels_3d=None,
-                      map_gt_bboxes_3d=None,
-                      map_gt_labels_3d=None,
-                      gt_labels=None,
-                      gt_bboxes=None,
-                      img=None,
-                      proposals=None,
-                      gt_bboxes_ignore=None,
-                      map_gt_bboxes_ignore=None,
-                      img_depth=None,
-                      img_mask=None,
-                      ego_his_trajs=None,
-                      ego_fut_trajs=None,
-                      ego_fut_masks=None,
-                      ego_fut_cmd=None,
-                      ego_lcf_feat=None,
-                      gt_attr_labels=None
-                      ):
+    def forward_train(
+        self,
+        points=None,
+        img_metas=None,
+        gt_bboxes_3d=None,
+        gt_labels_3d=None,
+        map_gt_bboxes_3d=None,
+        map_gt_labels_3d=None,
+        gt_labels=None,
+        gt_bboxes=None,
+        img=None,
+        proposals=None,
+        gt_bboxes_ignore=None,
+        map_gt_bboxes_ignore=None,
+        img_depth=None,
+        img_mask=None,
+        ego_his_trajs=None,
+        ego_fut_trajs=None,
+        ego_fut_masks=None,
+        ego_fut_cmd=None,
+        ego_lcf_feat=None,
+        gt_attr_labels=None
+    ):
         """Forward training function.
         Args:
             points (list[torch.Tensor], optional): Points of each sample.
@@ -287,12 +300,14 @@ class VAD(MVXTwoStageDetector):
         img_metas = [each[len_queue-1] for each in img_metas]
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
         losses = dict()
-        losses_pts = self.forward_pts_train(img_feats, gt_bboxes_3d, gt_labels_3d,
-                                            map_gt_bboxes_3d, map_gt_labels_3d, img_metas,
-                                            gt_bboxes_ignore, map_gt_bboxes_ignore, prev_bev,
-                                            ego_his_trajs=ego_his_trajs, ego_fut_trajs=ego_fut_trajs,
-                                            ego_fut_masks=ego_fut_masks, ego_fut_cmd=ego_fut_cmd,
-                                            ego_lcf_feat=ego_lcf_feat, gt_attr_labels=gt_attr_labels)
+        losses_pts = self.forward_pts_train(
+            img_feats, gt_bboxes_3d, gt_labels_3d,
+            map_gt_bboxes_3d, map_gt_labels_3d, img_metas,
+            gt_bboxes_ignore, map_gt_bboxes_ignore, prev_bev,
+            ego_his_trajs=ego_his_trajs, ego_fut_trajs=ego_fut_trajs,
+            ego_fut_masks=ego_fut_masks, ego_fut_cmd=ego_fut_cmd,
+            ego_lcf_feat=ego_lcf_feat, gt_attr_labels=gt_attr_labels
+        )
 
         losses.update(losses_pts)
         return losses

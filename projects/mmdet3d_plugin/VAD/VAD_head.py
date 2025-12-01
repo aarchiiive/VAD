@@ -1,14 +1,17 @@
 import copy
+import logging
+import time
 from math import pi, cos, sin
 
 import torch
+from torch.profiler import profile as torch_profile, ProfilerActivity
 import numpy as np
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from mmdet.models import HEADS, build_loss
 from mmdet.models.dense_heads import DETRHead
-from mmcv.runner import force_fp32, auto_fp16
+from mmcv.runner import force_fp32, auto_fp16, get_dist_info
 from mmcv.utils import TORCH_VERSION, digit_version
 from mmdet.core import build_assigner, build_sampler
 from mmdet3d.core.bbox.coders import build_bbox_coder
@@ -81,71 +84,75 @@ class VADHead(DETRHead):
             the Encoder and Decoder.
         bev_h, bev_w (int): spatial shape of BEV queries.
     """
-    def __init__(self,
-                 *args,
-                 with_box_refine=False,
-                 as_two_stage=False,
-                 transformer=None,
-                 bbox_coder=None,
-                 num_cls_fcs=2,
-                 code_weights=None,
-                 bev_h=30,
-                 bev_w=30,
-                 fut_ts=6,
-                 fut_mode=6,
-                 loss_traj=dict(type='L1Loss', loss_weight=0.25),
-                 loss_traj_cls=dict(
-                     type='FocalLoss',
-                     use_sigmoid=True,
-                     gamma=2.0,
-                     alpha=0.25,
-                     loss_weight=0.8),
-                 map_bbox_coder=None,
-                 map_num_query=900,
-                 map_num_classes=3,
-                 map_num_vec=20,
-                 map_num_pts_per_vec=2,
-                 map_num_pts_per_gt_vec=2,
-                 map_query_embed_type='all_pts',
-                 map_transform_method='minmax',
-                 map_gt_shift_pts_pattern='v0',
-                 map_dir_interval=1,
-                 map_code_size=None,
-                 map_code_weights=None,
-                loss_map_cls=dict(
-                     type='CrossEntropyLoss',
-                     bg_cls_weight=0.1,
-                     use_sigmoid=False,
-                     loss_weight=1.0,
-                     class_weight=1.0),
-                 loss_map_bbox=dict(type='L1Loss', loss_weight=5.0),
-                 loss_map_iou=dict(type='GIoULoss', loss_weight=2.0),
-                 loss_map_pts=dict(
-                    type='ChamferDistance',loss_src_weight=1.0,loss_dst_weight=1.0
-                 ),
-                 loss_map_dir=dict(type='PtsDirCosLoss', loss_weight=2.0),
-                 tot_epoch=None,
-                 use_traj_lr_warmup=False,
-                 motion_decoder=None,
-                 motion_map_decoder=None,
-                 use_pe=False,
-                 motion_det_score=None,
-                 map_thresh=0.5,
-                 dis_thresh=0.2,
-                 pe_normalization=True,
-                 ego_his_encoder=None,
-                 ego_fut_mode=3,
-                 loss_plan_reg=dict(type='L1Loss', loss_weight=0.25),
-                 loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=0.1),
-                 loss_plan_col=dict(type='PlanAgentDisLoss', loss_weight=0.1),
-                 loss_plan_dir=dict(type='PlanMapThetaLoss', loss_weight=0.1),
-                 ego_agent_decoder=None,
-                 ego_map_decoder=None,
-                 query_thresh=None,
-                 query_use_fix_pad=None,
-                 ego_lcf_feat_idx=None,
-                 valid_fut_ts=6,
-                 **kwargs):
+    def __init__(
+        self,
+        *args,
+        with_box_refine=False,
+        as_two_stage=False,
+        transformer=None,
+        bbox_coder=None,
+        num_cls_fcs=2,
+        code_weights=None,
+        bev_h=30,
+        bev_w=30,
+        fut_ts=6,
+        fut_mode=6,
+        loss_traj=dict(type='L1Loss', loss_weight=0.25),
+        loss_traj_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=0.8),
+        map_bbox_coder=None,
+        map_num_query=900,
+        map_num_classes=3,
+        map_num_vec=20,
+        map_num_pts_per_vec=2,
+        map_num_pts_per_gt_vec=2,
+        map_query_embed_type='all_pts',
+        map_transform_method='minmax',
+        map_gt_shift_pts_pattern='v0',
+        map_dir_interval=1,
+        map_code_size=None,
+        map_code_weights=None,
+        loss_map_cls=dict(
+            type='CrossEntropyLoss',
+            bg_cls_weight=0.1,
+            use_sigmoid=False,
+            loss_weight=1.0,
+            class_weight=1.0),
+        loss_map_bbox=dict(type='L1Loss', loss_weight=5.0),
+        loss_map_iou=dict(type='GIoULoss', loss_weight=2.0),
+        loss_map_pts=dict(
+        type='ChamferDistance',loss_src_weight=1.0,loss_dst_weight=1.0
+        ),
+        loss_map_dir=dict(type='PtsDirCosLoss', loss_weight=2.0),
+        tot_epoch=None,
+        use_traj_lr_warmup=False,
+        motion_decoder=None,
+        motion_map_decoder=None,
+        use_pe=False,
+        motion_det_score=None,
+        map_thresh=0.5,
+        dis_thresh=0.2,
+        pe_normalization=True,
+        ego_his_encoder=None,
+        ego_fut_mode=3,
+        loss_plan_reg=dict(type='L1Loss', loss_weight=0.25),
+        loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=0.1),
+        loss_plan_col=dict(type='PlanAgentDisLoss', loss_weight=0.1),
+        loss_plan_dir=dict(type='PlanMapThetaLoss', loss_weight=0.1),
+        ego_agent_decoder=None,
+        ego_map_decoder=None,
+        query_thresh=None,
+        query_use_fix_pad=None,
+        ego_lcf_feat_idx=None,
+        valid_fut_ts=6,
+        pred_map_only=False,
+        enable_profiler=False,
+        **kwargs
+    ):
 
         self.bev_h = bev_h
         self.bev_w = bev_w
@@ -169,6 +176,10 @@ class VADHead(DETRHead):
         self.query_use_fix_pad = query_use_fix_pad
         self.ego_lcf_feat_idx = ego_lcf_feat_idx
         self.valid_fut_ts = valid_fut_ts
+        self.pred_map_only = pred_map_only
+        self.enable_profiler = enable_profiler
+        self.profile_logger = logging.getLogger('mmdet')
+        self._torch_profile_done = False
 
         if loss_traj_cls['use_sigmoid'] == True:
             self.traj_num_cls = 1
@@ -285,35 +296,40 @@ class VADHead(DETRHead):
 
     def _init_layers(self):
         """Initialize classification branch and regression branch of head."""
-        cls_branch = []
-        for _ in range(self.num_reg_fcs):
-            cls_branch.append(Linear(self.embed_dims, self.embed_dims))
-            cls_branch.append(nn.LayerNorm(self.embed_dims))
-            cls_branch.append(nn.ReLU(inplace=True))
-        cls_branch.append(Linear(self.embed_dims, self.cls_out_channels))
-        cls_branch = nn.Sequential(*cls_branch)
+        cls_branch = None
+        reg_branch = None
+        traj_branch = None
+        traj_cls_branch = None
+        if not self.pred_map_only:
+            cls_branch = []
+            for _ in range(self.num_reg_fcs):
+                cls_branch.append(Linear(self.embed_dims, self.embed_dims))
+                cls_branch.append(nn.LayerNorm(self.embed_dims))
+                cls_branch.append(nn.ReLU(inplace=True))
+            cls_branch.append(Linear(self.embed_dims, self.cls_out_channels))
+            cls_branch = nn.Sequential(*cls_branch)
 
-        reg_branch = []
-        for _ in range(self.num_reg_fcs):
-            reg_branch.append(Linear(self.embed_dims, self.embed_dims))
-            reg_branch.append(nn.ReLU())
-        reg_branch.append(Linear(self.embed_dims, self.code_size))
-        reg_branch = nn.Sequential(*reg_branch)
+            reg_branch = []
+            for _ in range(self.num_reg_fcs):
+                reg_branch.append(Linear(self.embed_dims, self.embed_dims))
+                reg_branch.append(nn.ReLU())
+            reg_branch.append(Linear(self.embed_dims, self.code_size))
+            reg_branch = nn.Sequential(*reg_branch)
 
-        traj_branch = []
-        for _ in range(self.num_reg_fcs):
-            traj_branch.append(Linear(self.embed_dims*2, self.embed_dims*2))
-            traj_branch.append(nn.ReLU())
-        traj_branch.append(Linear(self.embed_dims*2, self.fut_ts*2))
-        traj_branch = nn.Sequential(*traj_branch)
+            traj_branch = []
+            for _ in range(self.num_reg_fcs):
+                traj_branch.append(Linear(self.embed_dims*2, self.embed_dims*2))
+                traj_branch.append(nn.ReLU())
+            traj_branch.append(Linear(self.embed_dims*2, self.fut_ts*2))
+            traj_branch = nn.Sequential(*traj_branch)
 
-        traj_cls_branch = []
-        for _ in range(self.num_reg_fcs):
-            traj_cls_branch.append(Linear(self.embed_dims*2, self.embed_dims*2))
-            traj_cls_branch.append(nn.LayerNorm(self.embed_dims*2))
-            traj_cls_branch.append(nn.ReLU(inplace=True))
-        traj_cls_branch.append(Linear(self.embed_dims*2, self.traj_num_cls))
-        traj_cls_branch = nn.Sequential(*traj_cls_branch)
+            traj_cls_branch = []
+            for _ in range(self.num_reg_fcs):
+                traj_cls_branch.append(Linear(self.embed_dims*2, self.embed_dims*2))
+                traj_cls_branch.append(nn.LayerNorm(self.embed_dims*2))
+                traj_cls_branch.append(nn.ReLU(inplace=True))
+            traj_cls_branch.append(Linear(self.embed_dims*2, self.traj_num_cls))
+            traj_cls_branch = nn.Sequential(*traj_cls_branch)
 
         map_cls_branch = []
         for _ in range(self.num_reg_fcs):
@@ -350,22 +366,31 @@ class VADHead(DETRHead):
         map_num_pred = (num_map_decoder_layers + 1) if \
             self.as_two_stage else num_map_decoder_layers
 
+        if not self.pred_map_only:
+            if self.with_box_refine:
+                self.cls_branches = _get_clones(cls_branch, num_pred)
+                self.reg_branches = _get_clones(reg_branch, num_pred)
+                self.traj_branches = _get_clones(traj_branch, motion_num_pred)
+                self.traj_cls_branches = _get_clones(traj_cls_branch, motion_num_pred)
+            else:
+                self.cls_branches = nn.ModuleList(
+                    [cls_branch for _ in range(num_pred)])
+                self.reg_branches = nn.ModuleList(
+                    [reg_branch for _ in range(num_pred)])
+                self.traj_branches = nn.ModuleList(
+                    [traj_branch for _ in range(motion_num_pred)])
+                self.traj_cls_branches = nn.ModuleList(
+                    [traj_cls_branch for _ in range(motion_num_pred)])
+        else:
+            self.cls_branches = None
+            self.reg_branches = None
+            self.traj_branches = None
+            self.traj_cls_branches = None
+
         if self.with_box_refine:
-            self.cls_branches = _get_clones(cls_branch, num_pred)
-            self.reg_branches = _get_clones(reg_branch, num_pred)
-            self.traj_branches = _get_clones(traj_branch, motion_num_pred)
-            self.traj_cls_branches = _get_clones(traj_cls_branch, motion_num_pred)
             self.map_cls_branches = _get_clones(map_cls_branch, map_num_pred)
             self.map_reg_branches = _get_clones(map_reg_branch, map_num_pred)
         else:
-            self.cls_branches = nn.ModuleList(
-                [cls_branch for _ in range(num_pred)])
-            self.reg_branches = nn.ModuleList(
-                [reg_branch for _ in range(num_pred)])
-            self.traj_branches = nn.ModuleList(
-                [traj_branch for _ in range(motion_num_pred)])
-            self.traj_cls_branches = nn.ModuleList(
-                [traj_cls_branch for _ in range(motion_num_pred)])
             self.map_cls_branches = nn.ModuleList(
                 [map_cls_branch for _ in range(map_num_pred)])
             self.map_reg_branches = nn.ModuleList(
@@ -374,8 +399,11 @@ class VADHead(DETRHead):
         if not self.as_two_stage:
             self.bev_embedding = nn.Embedding(
                 self.bev_h * self.bev_w, self.embed_dims)
-            self.query_embedding = nn.Embedding(self.num_query,
-                                                self.embed_dims * 2)
+            if not self.pred_map_only:
+                self.query_embedding = nn.Embedding(
+                    self.num_query, self.embed_dims * 2)
+            else:
+                self.query_embedding = None
             if self.map_query_embed_type == 'all_pts':
                 self.map_query_embedding = nn.Embedding(self.map_num_query,
                                                     self.embed_dims * 2)
@@ -384,7 +412,10 @@ class VADHead(DETRHead):
                 self.map_instance_embedding = nn.Embedding(self.map_num_vec, self.embed_dims * 2)
                 self.map_pts_embedding = nn.Embedding(self.map_num_pts_per_vec, self.embed_dims * 2)
 
-        if self.motion_decoder is not None:
+        if self.pred_map_only:
+            self.motion_decoder = None
+            self.motion_mode_query = None
+        elif self.motion_decoder is not None:
             self.motion_decoder = build_transformer_layer_sequence(self.motion_decoder)
             self.motion_mode_query = nn.Embedding(self.fut_mode, self.embed_dims)
             self.motion_mode_query.weight.requires_grad = True
@@ -393,46 +424,62 @@ class VADHead(DETRHead):
         else:
             raise NotImplementedError('Not implement yet')
 
-        if self.motion_map_decoder is not None:
+        if self.pred_map_only:
+            self.motion_map_decoder = None
+            self.lane_encoder = None
+        elif self.motion_map_decoder is not None:
             self.lane_encoder = LaneNet(256, 128, 3)
             self.motion_map_decoder = build_transformer_layer_sequence(self.motion_map_decoder)
             if self.use_pe:
                 self.pos_mlp = nn.Linear(2, self.embed_dims)
 
-        if self.ego_his_encoder is not None:
+        if self.pred_map_only:
+            self.ego_his_encoder = None
+            self.ego_query = None
+        elif self.ego_his_encoder is not None:
             self.ego_his_encoder = LaneNet(2, self.embed_dims//2, 3)
         else:
             self.ego_query = nn.Embedding(1, self.embed_dims)
 
-        if self.ego_agent_decoder is not None:
+        if self.pred_map_only:
+            self.ego_agent_decoder = None
+            self.ego_agent_pos_mlp = None
+        elif self.ego_agent_decoder is not None:
             self.ego_agent_decoder = build_transformer_layer_sequence(self.ego_agent_decoder)
             if self.use_pe:
                 self.ego_agent_pos_mlp = nn.Linear(2, self.embed_dims)
 
-        if self.ego_map_decoder is not None:
+        if self.pred_map_only:
+            self.ego_map_decoder = None
+            self.ego_map_pos_mlp = None
+        elif self.ego_map_decoder is not None:
             self.ego_map_decoder = build_transformer_layer_sequence(self.ego_map_decoder)
             if self.use_pe:
                 self.ego_map_pos_mlp = nn.Linear(2, self.embed_dims)
 
-        ego_fut_decoder = []
-        ego_fut_dec_in_dim = self.embed_dims*2 + len(self.ego_lcf_feat_idx) \
-            if self.ego_lcf_feat_idx is not None else self.embed_dims*2
-        for _ in range(self.num_reg_fcs):
-            ego_fut_decoder.append(Linear(ego_fut_dec_in_dim, ego_fut_dec_in_dim))
-            ego_fut_decoder.append(nn.ReLU())
-        ego_fut_decoder.append(Linear(ego_fut_dec_in_dim, self.ego_fut_mode*self.fut_ts*2))
-        self.ego_fut_decoder = nn.Sequential(*ego_fut_decoder)
+        if not self.pred_map_only:
+            ego_fut_decoder = []
+            ego_fut_dec_in_dim = self.embed_dims*2 + len(self.ego_lcf_feat_idx) \
+                if self.ego_lcf_feat_idx is not None else self.embed_dims*2
+            for _ in range(self.num_reg_fcs):
+                ego_fut_decoder.append(Linear(ego_fut_dec_in_dim, ego_fut_dec_in_dim))
+                ego_fut_decoder.append(nn.ReLU())
+            ego_fut_decoder.append(Linear(ego_fut_dec_in_dim, self.ego_fut_mode*self.fut_ts*2))
+            self.ego_fut_decoder = nn.Sequential(*ego_fut_decoder)
 
-        self.agent_fus_mlp = nn.Sequential(
-            nn.Linear(self.fut_mode*2*self.embed_dims, self.embed_dims, bias=True),
-            nn.LayerNorm(self.embed_dims),
-            nn.ReLU(),
-            nn.Linear(self.embed_dims, self.embed_dims, bias=True))
+            self.agent_fus_mlp = nn.Sequential(
+                nn.Linear(self.fut_mode*2*self.embed_dims, self.embed_dims, bias=True),
+                nn.LayerNorm(self.embed_dims),
+                nn.ReLU(),
+                nn.Linear(self.embed_dims, self.embed_dims, bias=True))
+        else:
+            self.ego_fut_decoder = None
+            self.agent_fus_mlp = None
 
     def init_weights(self):
         """Initialize weights of the DeformDETR head."""
         self.transformer.init_weights()
-        if self.loss_cls.use_sigmoid:
+        if (not self.pred_map_only) and self.loss_cls.use_sigmoid and self.cls_branches is not None:
             bias_init = bias_init_with_prob(0.01)
             for m in self.cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
@@ -440,7 +487,7 @@ class VADHead(DETRHead):
             bias_init = bias_init_with_prob(0.01)
             for m in self.map_cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
-        if self.loss_traj_cls.use_sigmoid:
+        if (not self.pred_map_only) and self.loss_traj_cls.use_sigmoid and self.traj_cls_branches is not None:
             bias_init = bias_init_with_prob(0.01)
             for m in self.traj_cls_branches:
                 nn.init.constant_(m[-1].bias, bias_init)
@@ -478,14 +525,63 @@ class VADHead(DETRHead):
 
     # @auto_fp16(apply_to=('mlvl_feats'))
     @force_fp32(apply_to=('mlvl_feats', 'prev_bev'))
-    def forward(self,
-                mlvl_feats,
-                img_metas,
-                prev_bev=None,
-                only_bev=False,
-                ego_his_trajs=None,
-                ego_lcf_feat=None,
-            ):
+    def forward(
+        self,
+        mlvl_feats,
+        img_metas,
+        prev_bev=None,
+        only_bev=False,
+        ego_his_trajs=None,
+        ego_lcf_feat=None,
+        pred_map_only=False,
+    ):
+        use_profiler = getattr(self, 'enable_profiler', False)
+        if use_profiler and not getattr(self, '_torch_profile_done', False):
+            activities = [ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(ProfilerActivity.CUDA)
+            with torch_profile(
+                activities=activities,
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False
+            ) as prof:
+                outs = self._forward_impl(
+                    mlvl_feats,
+                    img_metas,
+                    prev_bev=prev_bev,
+                    only_bev=only_bev,
+                    ego_his_trajs=ego_his_trajs,
+                    ego_lcf_feat=ego_lcf_feat,
+                    pred_map_only=pred_map_only
+                )
+            rank, _ = get_dist_info()
+            if rank == 0:
+                table = prof.key_averages().table(sort_by='cuda_time_total', row_limit=20)
+                self.profile_logger.info('[VADHead][torch.profiler]\n%s', table)
+            self._torch_profile_done = True
+            return outs
+
+        return self._forward_impl(
+            mlvl_feats,
+            img_metas,
+            prev_bev=prev_bev,
+            only_bev=only_bev,
+            ego_his_trajs=ego_his_trajs,
+            ego_lcf_feat=ego_lcf_feat,
+            pred_map_only=pred_map_only
+        )
+
+    def _forward_impl(
+        self,
+        mlvl_feats,
+        img_metas,
+        prev_bev=None,
+        only_bev=False,
+        ego_his_trajs=None,
+        ego_lcf_feat=None,
+        pred_map_only=False,
+    ):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -502,9 +598,43 @@ class VADHead(DETRHead):
                 Shape [nb_dec, bs, num_query, 9].
         """
 
+        pred_map_only = pred_map_only or self.pred_map_only
+        profile_enabled = self.enable_profiler
+        profile_data = {}
+        profile_records = {}
+        cuda_available = torch.cuda.is_available()
+
+        def _tic(key):
+            if not profile_enabled:
+                return
+            if cuda_available:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                profile_records[key] = dict(type='cuda', start=start, end=end)
+                start.record()
+            else:
+                profile_records[key] = dict(type='cpu', time=-time.perf_counter())
+
+        def _toc(key):
+            if not profile_enabled:
+                return
+            rec = profile_records.get(key)
+            if rec is None:
+                return
+            if rec['type'] == 'cuda':
+                rec['end'].record()
+                torch.cuda.synchronize()
+                duration = rec['start'].elapsed_time(rec['end']) / 1000.0  # seconds
+                profile_data[key] = duration
+            else:
+                rec['time'] += time.perf_counter()
+                profile_data[key] = rec['time']
+
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
-        object_query_embeds = self.query_embedding.weight.to(dtype)
+        object_query_embeds = None
+        if (not pred_map_only) and (self.query_embedding is not None):
+            object_query_embeds = self.query_embedding.weight.to(dtype)
 
         if self.map_query_embed_type == 'all_pts':
             map_query_embeds = self.map_query_embedding.weight.to(dtype)
@@ -532,6 +662,7 @@ class VADHead(DETRHead):
                 prev_bev=prev_bev,
             )
         else:
+            _tic('transformer')
             outputs = self.transformer(
                 mlvl_feats,
                 bev_queries,
@@ -542,58 +673,71 @@ class VADHead(DETRHead):
                 grid_length=(self.real_h / self.bev_h,
                              self.real_w / self.bev_w),
                 bev_pos=bev_pos,
-                reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
-                cls_branches=self.cls_branches if self.as_two_stage else None,
+                reg_branches=self.reg_branches if (self.with_box_refine and not pred_map_only) else None,  # noqa:E501
+                cls_branches=self.cls_branches if (self.as_two_stage and not pred_map_only) else None,
                 map_reg_branches=self.map_reg_branches if self.with_box_refine else None,  # noqa:E501
                 map_cls_branches=self.map_cls_branches if self.as_two_stage else None,
                 img_metas=img_metas,
                 prev_bev=prev_bev
-        )
+            )
+            _toc('transformer')
 
         bev_embed, hs, init_reference, inter_references, \
             map_hs, map_init_reference, map_inter_references = outputs
 
-        hs = hs.permute(0, 2, 1, 3)
-        outputs_classes = []
-        outputs_coords = []
-        outputs_coords_bev = []
-        outputs_trajs = []
-        outputs_trajs_classes = []
-
+        if hs is not None:
+            hs = hs.permute(0, 2, 1, 3)
         map_hs = map_hs.permute(0, 2, 1, 3)
+
+        outputs_classes = None
+        outputs_coords = None
+        outputs_coords_bev = None
+        outputs_trajs = None
+        outputs_trajs_classes = None
+
         map_outputs_classes = []
         map_outputs_coords = []
         map_outputs_pts_coords = []
         map_outputs_coords_bev = []
 
-        for lvl in range(hs.shape[0]):
-            if lvl == 0:
-                reference = init_reference
-            else:
-                reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
-            outputs_class = self.cls_branches[lvl](hs[lvl])
-            tmp = self.reg_branches[lvl](hs[lvl])
+        if not pred_map_only:
+            _tic('det_branch')
+            outputs_classes = []
+            outputs_coords = []
+            outputs_coords_bev = []
+            outputs_trajs = []
+            outputs_trajs_classes = []
 
-            # TODO: check the shape of reference
-            assert reference.shape[-1] == 3
-            tmp[..., 0:2] = tmp[..., 0:2] + reference[..., 0:2]
-            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
-            outputs_coords_bev.append(tmp[..., 0:2].clone().detach())
-            tmp[..., 4:5] = tmp[..., 4:5] + reference[..., 2:3]
-            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
-            tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
-                             self.pc_range[0]) + self.pc_range[0])
-            tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
-                             self.pc_range[1]) + self.pc_range[1])
-            tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
-                             self.pc_range[2]) + self.pc_range[2])
+            for lvl in range(hs.shape[0]):
+                if lvl == 0:
+                    reference = init_reference
+                else:
+                    reference = inter_references[lvl - 1]
+                reference = inverse_sigmoid(reference)
+                outputs_class = self.cls_branches[lvl](hs[lvl])
+                tmp = self.reg_branches[lvl](hs[lvl])
 
-            # TODO: check if using sigmoid
-            outputs_coord = tmp
-            outputs_classes.append(outputs_class)
-            outputs_coords.append(outputs_coord)
+                # TODO: check the shape of reference
+                assert reference.shape[-1] == 3
+                tmp[..., 0:2] = tmp[..., 0:2] + reference[..., 0:2]
+                tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
+                outputs_coords_bev.append(tmp[..., 0:2].clone().detach())
+                tmp[..., 4:5] = tmp[..., 4:5] + reference[..., 2:3]
+                tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+                tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
+                                 self.pc_range[0]) + self.pc_range[0])
+                tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
+                                 self.pc_range[1]) + self.pc_range[1])
+                tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
+                                 self.pc_range[2]) + self.pc_range[2])
 
+                # TODO: check if using sigmoid
+                outputs_coord = tmp
+                outputs_classes.append(outputs_class)
+                outputs_coords.append(outputs_coord)
+            _toc('det_branch')
+
+        _tic('map_branch')
         for lvl in range(map_hs.shape[0]):
             if lvl == 0:
                 reference = map_init_reference
@@ -613,192 +757,212 @@ class VADHead(DETRHead):
             map_outputs_classes.append(map_outputs_class)
             map_outputs_coords.append(map_outputs_coord)
             map_outputs_pts_coords.append(map_outputs_pts_coord)
+        _toc('map_branch')
 
-        if self.motion_decoder is not None:
-            batch_size, num_agent = outputs_coords_bev[-1].shape[:2]
-            # motion_query
-            motion_query = hs[-1].permute(1, 0, 2)  # [A, B, D]
-            mode_query = self.motion_mode_query.weight  # [fut_mode, D]
-            # [M, B, D], M=A*fut_mode
-            motion_query = (motion_query[:, None, :, :] + mode_query[None, :, None, :]).flatten(0, 1)
-            if self.use_pe:
-                motion_coords = outputs_coords_bev[-1]  # [B, A, 2]
-                motion_pos = self.pos_mlp_sa(motion_coords)  # [B, A, D]
-                motion_pos = motion_pos.unsqueeze(2).repeat(1, 1, self.fut_mode, 1).flatten(1, 2)
-                motion_pos = motion_pos.permute(1, 0, 2)  # [M, B, D]
-            else:
-                motion_pos = None
-
-            if self.motion_det_score is not None:
-                motion_score = outputs_classes[-1]
-                max_motion_score = motion_score.max(dim=-1)[0]
-                invalid_motion_idx = max_motion_score < self.motion_det_score  # [B, A]
-                invalid_motion_idx = invalid_motion_idx.unsqueeze(2).repeat(1, 1, self.fut_mode).flatten(1, 2)
-            else:
-                invalid_motion_idx = None
-
-            motion_hs = self.motion_decoder(
-                query=motion_query,
-                key=motion_query,
-                value=motion_query,
-                query_pos=motion_pos,
-                key_pos=motion_pos,
-                key_padding_mask=invalid_motion_idx)
-
-            if self.motion_map_decoder is not None:
-                # map preprocess
-                motion_coords = outputs_coords_bev[-1]  # [B, A, 2]
-                motion_coords = motion_coords.unsqueeze(2).repeat(1, 1, self.fut_mode, 1).flatten(1, 2)
-                map_query = map_hs[-1].view(batch_size, self.map_num_vec, self.map_num_pts_per_vec, -1)
-                map_query = self.lane_encoder(map_query)  # [B, P, pts, D] -> [B, P, D]
-                map_score = map_outputs_classes[-1]
-                map_pos = map_outputs_coords_bev[-1]
-                map_query, map_pos, key_padding_mask = self.select_and_pad_pred_map(
-                    motion_coords, map_query, map_score, map_pos,
-                    map_thresh=self.map_thresh, dis_thresh=self.dis_thresh,
-                    pe_normalization=self.pe_normalization, use_fix_pad=True)
-                map_query = map_query.permute(1, 0, 2)  # [P, B*M, D]
-                ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)
-
-                # position encoding
+        outputs_ego_trajs = None
+        if not pred_map_only:
+            _tic('motion_decoder')
+            if self.motion_decoder is not None:
+                batch_size, num_agent = outputs_coords_bev[-1].shape[:2]
+                # motion_query
+                motion_query = hs[-1].permute(1, 0, 2)  # [A, B, D]
+                mode_query = self.motion_mode_query.weight  # [fut_mode, D]
+                # [M, B, D], M=A*fut_mode
+                motion_query = (motion_query[:, None, :, :] + mode_query[None, :, None, :]).flatten(0, 1)
                 if self.use_pe:
-                    (num_query, batch) = ca_motion_query.shape[:2]
-                    motion_pos = torch.zeros((num_query, batch, 2), device=motion_hs.device)
-                    motion_pos = self.pos_mlp(motion_pos)
-                    map_pos = map_pos.permute(1, 0, 2)
-                    map_pos = self.pos_mlp(map_pos)
+                    motion_coords = outputs_coords_bev[-1]  # [B, A, 2]
+                    motion_pos = self.pos_mlp_sa(motion_coords)  # [B, A, D]
+                    motion_pos = motion_pos.unsqueeze(2).repeat(1, 1, self.fut_mode, 1).flatten(1, 2)
+                    motion_pos = motion_pos.permute(1, 0, 2)  # [M, B, D]
                 else:
-                    motion_pos, map_pos = None, None
+                    motion_pos = None
 
-                ca_motion_query = self.motion_map_decoder(
-                    query=ca_motion_query,
-                    key=map_query,
-                    value=map_query,
+                if self.motion_det_score is not None:
+                    motion_score = outputs_classes[-1]
+                    max_motion_score = motion_score.max(dim=-1)[0]
+                    invalid_motion_idx = max_motion_score < self.motion_det_score  # [B, A]
+                    invalid_motion_idx = invalid_motion_idx.unsqueeze(2).repeat(1, 1, self.fut_mode).flatten(1, 2)
+                else:
+                    invalid_motion_idx = None
+
+                motion_hs = self.motion_decoder(
+                    query=motion_query,
+                    key=motion_query,
+                    value=motion_query,
                     query_pos=motion_pos,
-                    key_pos=map_pos,
-                    key_padding_mask=key_padding_mask)
+                    key_pos=motion_pos,
+                    key_padding_mask=invalid_motion_idx)
+
+                if self.motion_map_decoder is not None:
+                    # map preprocess
+                    motion_coords = outputs_coords_bev[-1]  # [B, A, 2]
+                    motion_coords = motion_coords.unsqueeze(2).repeat(1, 1, self.fut_mode, 1).flatten(1, 2)
+                    map_query = map_hs[-1].view(batch_size, self.map_num_vec, self.map_num_pts_per_vec, -1)
+                    map_query = self.lane_encoder(map_query)  # [B, P, pts, D] -> [B, P, D]
+                    map_score = map_outputs_classes[-1]
+                    map_pos = map_outputs_coords_bev[-1]
+                    map_query, map_pos, key_padding_mask = self.select_and_pad_pred_map(
+                        motion_coords, map_query, map_score, map_pos,
+                        map_thresh=self.map_thresh, dis_thresh=self.dis_thresh,
+                        pe_normalization=self.pe_normalization, use_fix_pad=True)
+                    map_query = map_query.permute(1, 0, 2)  # [P, B*M, D]
+                    ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)
+
+                    # position encoding
+                    if self.use_pe:
+                        (num_query, batch) = ca_motion_query.shape[:2]
+                        motion_pos = torch.zeros((num_query, batch, 2), device=motion_hs.device)
+                        motion_pos = self.pos_mlp(motion_pos)
+                        map_pos = map_pos.permute(1, 0, 2)
+                        map_pos = self.pos_mlp(map_pos)
+                    else:
+                        motion_pos, map_pos = None, None
+
+                    ca_motion_query = self.motion_map_decoder(
+                        query=ca_motion_query,
+                        key=map_query,
+                        value=map_query,
+                        query_pos=motion_pos,
+                        key_pos=map_pos,
+                        key_padding_mask=key_padding_mask)
+                else:
+                    ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)
+
+                batch_size = outputs_coords_bev[-1].shape[0]
+                motion_hs = motion_hs.permute(1, 0, 2).unflatten(
+                    dim=1, sizes=(num_agent, self.fut_mode)
+                )
+                ca_motion_query = ca_motion_query.squeeze(0).unflatten(
+                    dim=0, sizes=(batch_size, num_agent, self.fut_mode)
+                )
+                motion_hs = torch.cat([motion_hs, ca_motion_query], dim=-1)  # [B, A, fut_mode, 2D]
             else:
-                ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)
+                raise NotImplementedError('Not implement yet')
 
-            batch_size = outputs_coords_bev[-1].shape[0]
-            motion_hs = motion_hs.permute(1, 0, 2).unflatten(
-                dim=1, sizes=(num_agent, self.fut_mode)
-            )
-            ca_motion_query = ca_motion_query.squeeze(0).unflatten(
-                dim=0, sizes=(batch_size, num_agent, self.fut_mode)
-            )
-            motion_hs = torch.cat([motion_hs, ca_motion_query], dim=-1)  # [B, A, fut_mode, 2D]
-        else:
-            raise NotImplementedError('Not implement yet')
+            _toc('motion_decoder')
 
-        outputs_traj = self.traj_branches[0](motion_hs)
-        outputs_trajs.append(outputs_traj)
-        outputs_traj_class = self.traj_cls_branches[0](motion_hs)
-        outputs_trajs_classes.append(outputs_traj_class.squeeze(-1))
-        (batch, num_agent) = motion_hs.shape[:2]
+            _tic('planning')
+            outputs_traj = self.traj_branches[0](motion_hs)
+            outputs_trajs.append(outputs_traj)
+            outputs_traj_class = self.traj_cls_branches[0](motion_hs)
+            outputs_trajs_classes.append(outputs_traj_class.squeeze(-1))
+            (batch, num_agent) = motion_hs.shape[:2]
 
         map_outputs_classes = torch.stack(map_outputs_classes)
         map_outputs_coords = torch.stack(map_outputs_coords)
         map_outputs_pts_coords = torch.stack(map_outputs_pts_coords)
 
-        outputs_classes = torch.stack(outputs_classes)
-        outputs_coords = torch.stack(outputs_coords)
-        outputs_trajs = torch.stack(outputs_trajs)
-        outputs_trajs_classes = torch.stack(outputs_trajs_classes)
+        traj_preds = None
+        traj_cls_preds = None
 
-        # planning
-        (batch, num_agent) = motion_hs.shape[:2]
-        if self.ego_his_encoder is not None:
-            ego_his_feats = self.ego_his_encoder(ego_his_trajs)  # [B, 1, dim]
+        if not pred_map_only:
+            outputs_classes = torch.stack(outputs_classes)
+            outputs_coords = torch.stack(outputs_coords)
+            outputs_trajs = torch.stack(outputs_trajs)
+            outputs_trajs_classes = torch.stack(outputs_trajs_classes)
+
+            # planning
+            (batch, num_agent) = motion_hs.shape[:2]
+            if self.ego_his_encoder is not None:
+                ego_his_feats = self.ego_his_encoder(ego_his_trajs)  # [B, 1, dim]
+            else:
+                ego_his_feats = self.ego_query.weight.unsqueeze(0).repeat(batch, 1, 1)
+            # Interaction
+            ego_query = ego_his_feats
+            ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)
+            ego_pos_emb = self.ego_agent_pos_mlp(ego_pos)
+            agent_conf = outputs_classes[-1]
+            agent_query = motion_hs.reshape(batch, num_agent, -1)
+            agent_query = self.agent_fus_mlp(agent_query) # [B, A, fut_mode, 2*D] -> [B, A, D]
+            agent_pos = outputs_coords_bev[-1]
+            agent_query, agent_pos, agent_mask = self.select_and_pad_query(
+                agent_query, agent_pos, agent_conf,
+                score_thresh=self.query_thresh, use_fix_pad=self.query_use_fix_pad
+            )
+            agent_pos_emb = self.ego_agent_pos_mlp(agent_pos)
+            # ego <-> agent interaction
+            ego_agent_query = self.ego_agent_decoder(
+                query=ego_query.permute(1, 0, 2),
+                key=agent_query.permute(1, 0, 2),
+                value=agent_query.permute(1, 0, 2),
+                query_pos=ego_pos_emb.permute(1, 0, 2),
+                key_pos=agent_pos_emb.permute(1, 0, 2),
+                key_padding_mask=agent_mask)
+
+            # ego <-> map interaction
+            ego_pos = torch.zeros((batch, 1, 2), device=agent_query.device)
+            ego_pos_emb = self.ego_map_pos_mlp(ego_pos)
+            map_query = map_hs[-1].view(batch_size, self.map_num_vec, self.map_num_pts_per_vec, -1)
+            map_query = self.lane_encoder(map_query)  # [B, P, pts, D] -> [B, P, D]
+            map_conf = map_outputs_classes[-1]
+            map_pos = map_outputs_coords_bev[-1]
+            # use the most close pts pos in each map inst as the inst's pos
+            batch, num_map = map_pos.shape[:2]
+            map_dis = torch.sqrt(map_pos[..., 0]**2 + map_pos[..., 1]**2)
+            min_map_pos_idx = map_dis.argmin(dim=-1).flatten()  # [B*P]
+            min_map_pos = map_pos.flatten(0, 1)  # [B*P, pts, 2]
+            min_map_pos = min_map_pos[range(min_map_pos.shape[0]), min_map_pos_idx]  # [B*P, 2]
+            min_map_pos = min_map_pos.view(batch, num_map, 2)  # [B, P, 2]
+            map_query, map_pos, map_mask = self.select_and_pad_query(
+                map_query, min_map_pos, map_conf,
+                score_thresh=self.query_thresh, use_fix_pad=self.query_use_fix_pad
+            )
+            map_pos_emb = self.ego_map_pos_mlp(map_pos)
+            ego_map_query = self.ego_map_decoder(
+                query=ego_agent_query,
+                key=map_query.permute(1, 0, 2),
+                value=map_query.permute(1, 0, 2),
+                query_pos=ego_pos_emb.permute(1, 0, 2),
+                key_pos=map_pos_emb.permute(1, 0, 2),
+                key_padding_mask=map_mask)
+
+            if self.ego_his_encoder is not None and self.ego_lcf_feat_idx is not None:
+                ego_feats = torch.cat(
+                    [ego_his_feats,
+                     ego_map_query.permute(1, 0, 2),
+                     ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]],
+                    dim=-1
+                )  # [B, 1, 2D+2]
+            elif self.ego_his_encoder is not None and self.ego_lcf_feat_idx is None:
+                ego_feats = torch.cat(
+                    [ego_his_feats,
+                     ego_map_query.permute(1, 0, 2)],
+                    dim=-1
+                )  # [B, 1, 2D]
+            elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is not None:
+                ego_feats = torch.cat(
+                    [ego_agent_query.permute(1, 0, 2),
+                     ego_map_query.permute(1, 0, 2),
+                     ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]],
+                    dim=-1
+                )  # [B, 1, 2D+2]
+            elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is None:
+                ego_feats = torch.cat(
+                    [ego_agent_query.permute(1, 0, 2),
+                     ego_map_query.permute(1, 0, 2)],
+                    dim=-1
+                )  # [B, 1, 2D]
+
+            # Ego prediction
+            outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
+            outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0],
+                                                          self.ego_fut_mode, self.fut_ts, 2)
+
+            traj_preds = outputs_trajs.repeat(outputs_coords.shape[0], 1, 1, 1, 1)
+            traj_cls_preds = outputs_trajs_classes.repeat(outputs_coords.shape[0], 1, 1, 1)
+            _toc('planning')
         else:
-            ego_his_feats = self.ego_query.weight.unsqueeze(0).repeat(batch, 1, 1)
-        # Interaction
-        ego_query = ego_his_feats
-        ego_pos = torch.zeros((batch, 1, 2), device=ego_query.device)
-        ego_pos_emb = self.ego_agent_pos_mlp(ego_pos)
-        agent_conf = outputs_classes[-1]
-        agent_query = motion_hs.reshape(batch, num_agent, -1)
-        agent_query = self.agent_fus_mlp(agent_query) # [B, A, fut_mode, 2*D] -> [B, A, D]
-        agent_pos = outputs_coords_bev[-1]
-        agent_query, agent_pos, agent_mask = self.select_and_pad_query(
-            agent_query, agent_pos, agent_conf,
-            score_thresh=self.query_thresh, use_fix_pad=self.query_use_fix_pad
-        )
-        agent_pos_emb = self.ego_agent_pos_mlp(agent_pos)
-        # ego <-> agent interaction
-        ego_agent_query = self.ego_agent_decoder(
-            query=ego_query.permute(1, 0, 2),
-            key=agent_query.permute(1, 0, 2),
-            value=agent_query.permute(1, 0, 2),
-            query_pos=ego_pos_emb.permute(1, 0, 2),
-            key_pos=agent_pos_emb.permute(1, 0, 2),
-            key_padding_mask=agent_mask)
-
-        # ego <-> map interaction
-        ego_pos = torch.zeros((batch, 1, 2), device=agent_query.device)
-        ego_pos_emb = self.ego_map_pos_mlp(ego_pos)
-        map_query = map_hs[-1].view(batch_size, self.map_num_vec, self.map_num_pts_per_vec, -1)
-        map_query = self.lane_encoder(map_query)  # [B, P, pts, D] -> [B, P, D]
-        map_conf = map_outputs_classes[-1]
-        map_pos = map_outputs_coords_bev[-1]
-        # use the most close pts pos in each map inst as the inst's pos
-        batch, num_map = map_pos.shape[:2]
-        map_dis = torch.sqrt(map_pos[..., 0]**2 + map_pos[..., 1]**2)
-        min_map_pos_idx = map_dis.argmin(dim=-1).flatten()  # [B*P]
-        min_map_pos = map_pos.flatten(0, 1)  # [B*P, pts, 2]
-        min_map_pos = min_map_pos[range(min_map_pos.shape[0]), min_map_pos_idx]  # [B*P, 2]
-        min_map_pos = min_map_pos.view(batch, num_map, 2)  # [B, P, 2]
-        map_query, map_pos, map_mask = self.select_and_pad_query(
-            map_query, min_map_pos, map_conf,
-            score_thresh=self.query_thresh, use_fix_pad=self.query_use_fix_pad
-        )
-        map_pos_emb = self.ego_map_pos_mlp(map_pos)
-        ego_map_query = self.ego_map_decoder(
-            query=ego_agent_query,
-            key=map_query.permute(1, 0, 2),
-            value=map_query.permute(1, 0, 2),
-            query_pos=ego_pos_emb.permute(1, 0, 2),
-            key_pos=map_pos_emb.permute(1, 0, 2),
-            key_padding_mask=map_mask)
-
-        if self.ego_his_encoder is not None and self.ego_lcf_feat_idx is not None:
-            ego_feats = torch.cat(
-                [ego_his_feats,
-                 ego_map_query.permute(1, 0, 2),
-                 ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]],
-                dim=-1
-            )  # [B, 1, 2D+2]
-        elif self.ego_his_encoder is not None and self.ego_lcf_feat_idx is None:
-            ego_feats = torch.cat(
-                [ego_his_feats,
-                 ego_map_query.permute(1, 0, 2)],
-                dim=-1
-            )  # [B, 1, 2D]
-        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is not None:
-            ego_feats = torch.cat(
-                [ego_agent_query.permute(1, 0, 2),
-                 ego_map_query.permute(1, 0, 2),
-                 ego_lcf_feat.squeeze(1)[..., self.ego_lcf_feat_idx]],
-                dim=-1
-            )  # [B, 1, 2D+2]
-        elif self.ego_his_encoder is None and self.ego_lcf_feat_idx is None:
-            ego_feats = torch.cat(
-                [ego_agent_query.permute(1, 0, 2),
-                 ego_map_query.permute(1, 0, 2)],
-                dim=-1
-            )  # [B, 1, 2D]
-
-        # Ego prediction
-        outputs_ego_trajs = self.ego_fut_decoder(ego_feats)
-        outputs_ego_trajs = outputs_ego_trajs.reshape(outputs_ego_trajs.shape[0],
-                                                      self.ego_fut_mode, self.fut_ts, 2)
+            outputs_classes = None
+            outputs_coords = None
+            outputs_trajs = None
+            outputs_trajs_classes = None
 
         outs = {
             'bev_embed': bev_embed,
             'all_cls_scores': outputs_classes,
             'all_bbox_preds': outputs_coords,
-            'all_traj_preds': outputs_trajs.repeat(outputs_coords.shape[0], 1, 1, 1, 1),
-            'all_traj_cls_scores': outputs_trajs_classes.repeat(outputs_coords.shape[0], 1, 1, 1),
+            'all_traj_preds': traj_preds,
+            'all_traj_cls_scores': traj_cls_preds,
             'map_all_cls_scores': map_outputs_classes,
             'map_all_bbox_preds': map_outputs_coords,
             'map_all_pts_preds': map_outputs_pts_coords,
@@ -808,7 +972,14 @@ class VADHead(DETRHead):
             'map_enc_bbox_preds': None,
             'map_enc_pts_preds': None,
             'ego_fut_preds': outputs_ego_trajs,
+            'pred_map_only': pred_map_only,
         }
+
+        if profile_enabled and profile_data:
+            rank, _ = get_dist_info()
+            if rank == 0:
+                msg = ', '.join([f'{k}:{v * 1000:.2f}ms' for k, v in profile_data.items()])
+                self.profile_logger.info(f'[VADHead][profile] {msg}')
 
         return outs
 
@@ -1535,38 +1706,43 @@ class VADHead(DETRHead):
 
         map_gt_vecs_list = copy.deepcopy(map_gt_bboxes_list)
 
-        all_cls_scores = preds_dicts['all_cls_scores']
-        all_bbox_preds = preds_dicts['all_bbox_preds']
-        all_traj_preds = preds_dicts['all_traj_preds']
-        all_traj_cls_scores = preds_dicts['all_traj_cls_scores']
-        enc_cls_scores = preds_dicts['enc_cls_scores']
-        enc_bbox_preds = preds_dicts['enc_bbox_preds']
+        pred_map_only = preds_dicts.get('pred_map_only', False) or self.pred_map_only
+
+        all_cls_scores = preds_dicts.get('all_cls_scores')
+        all_bbox_preds = preds_dicts.get('all_bbox_preds')
+        all_traj_preds = preds_dicts.get('all_traj_preds')
+        all_traj_cls_scores = preds_dicts.get('all_traj_cls_scores')
+        enc_cls_scores = preds_dicts.get('enc_cls_scores')
+        enc_bbox_preds = preds_dicts.get('enc_bbox_preds')
         map_all_cls_scores = preds_dicts['map_all_cls_scores']
         map_all_bbox_preds = preds_dicts['map_all_bbox_preds']
         map_all_pts_preds = preds_dicts['map_all_pts_preds']
         map_enc_cls_scores = preds_dicts['map_enc_cls_scores']
         map_enc_bbox_preds = preds_dicts['map_enc_bbox_preds']
         map_enc_pts_preds = preds_dicts['map_enc_pts_preds']
-        ego_fut_preds = preds_dicts['ego_fut_preds']
+        ego_fut_preds = preds_dicts.get('ego_fut_preds')
 
-        num_dec_layers = len(all_cls_scores)
-        device = gt_labels_list[0].device
+        loss_dict = dict()
 
-        gt_bboxes_list = [torch.cat(
-            (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
-            dim=1).to(device) for gt_bboxes in gt_bboxes_list]
+        if not pred_map_only:
+            num_dec_layers = len(all_cls_scores)
+            device = gt_labels_list[0].device
 
-        all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
-        all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
-        all_gt_attr_labels_list = [gt_attr_labels for _ in range(num_dec_layers)]
-        all_gt_bboxes_ignore_list = [
-            gt_bboxes_ignore for _ in range(num_dec_layers)
-        ]
+            gt_bboxes_list = [torch.cat(
+                (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
+                dim=1).to(device) for gt_bboxes in gt_bboxes_list]
 
-        losses_cls, losses_bbox, loss_traj, loss_traj_cls = multi_apply(
-            self.loss_single, all_cls_scores, all_bbox_preds, all_traj_preds,
-            all_traj_cls_scores, all_gt_bboxes_list, all_gt_labels_list,
-            all_gt_attr_labels_list, all_gt_bboxes_ignore_list)
+            all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
+            all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
+            all_gt_attr_labels_list = [gt_attr_labels for _ in range(num_dec_layers)]
+            all_gt_bboxes_ignore_list = [
+                gt_bboxes_ignore for _ in range(num_dec_layers)
+            ]
+
+            losses_cls, losses_bbox, loss_traj, loss_traj_cls = multi_apply(
+                self.loss_single, all_cls_scores, all_bbox_preds, all_traj_preds,
+                all_traj_cls_scores, all_gt_bboxes_list, all_gt_labels_list,
+                all_gt_attr_labels_list, all_gt_bboxes_ignore_list)
 
 
         num_dec_layers = len(map_all_cls_scores)
@@ -1607,44 +1783,44 @@ class VADHead(DETRHead):
             map_all_pts_preds, map_all_gt_bboxes_list, map_all_gt_labels_list,
             map_all_gt_shifts_pts_list, map_all_gt_bboxes_ignore_list)
 
-        loss_dict = dict()
-        # loss from the last decoder layer
-        loss_dict['loss_cls'] = losses_cls[-1]
-        loss_dict['loss_bbox'] = losses_bbox[-1]
-        loss_dict['loss_traj'] = loss_traj[-1]
-        loss_dict['loss_traj_cls'] = loss_traj_cls[-1]
-        # loss from the last decoder layer
+        if not pred_map_only:
+            # loss from the last decoder layer
+            loss_dict['loss_cls'] = losses_cls[-1]
+            loss_dict['loss_bbox'] = losses_bbox[-1]
+            loss_dict['loss_traj'] = loss_traj[-1]
+            loss_dict['loss_traj_cls'] = loss_traj_cls[-1]
+
+            # Planning Loss
+            ego_fut_gt = ego_fut_gt.squeeze(1)
+            ego_fut_masks = ego_fut_masks.squeeze(1).squeeze(1)
+            ego_fut_cmd = ego_fut_cmd.squeeze(1).squeeze(1)
+
+            batch, num_agent = all_traj_preds[-1].shape[:2]
+            agent_fut_preds = all_traj_preds[-1].view(batch, num_agent, self.fut_mode, self.fut_ts, 2)
+            agent_fut_cls_preds = all_traj_cls_scores[-1].view(batch, num_agent, self.fut_mode)
+            loss_plan_input = [ego_fut_preds, ego_fut_gt, ego_fut_masks, ego_fut_cmd,
+                               map_all_pts_preds[-1], map_all_cls_scores[-1].sigmoid(),
+                               all_bbox_preds[-1][..., 0:2], agent_fut_preds,
+                               all_cls_scores[-1].sigmoid(), agent_fut_cls_preds.sigmoid()]
+
+            loss_planning_dict = self.loss_planning(*loss_plan_input)
+            loss_dict['loss_plan_reg'] = loss_planning_dict['loss_plan_reg']
+            loss_dict['loss_plan_bound'] = loss_planning_dict['loss_plan_bound']
+            loss_dict['loss_plan_col'] = loss_planning_dict['loss_plan_col']
+            loss_dict['loss_plan_dir'] = loss_planning_dict['loss_plan_dir']
+
+            # loss from other decoder layers
+            num_dec_layer = 0
+            for loss_cls_i, loss_bbox_i in zip(losses_cls[:-1], losses_bbox[:-1]):
+                loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
+                loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
+                num_dec_layer += 1
+        # loss from the last decoder layer for map branch
         loss_dict['loss_map_cls'] = map_losses_cls[-1]
         loss_dict['loss_map_bbox'] = map_losses_bbox[-1]
         loss_dict['loss_map_iou'] = map_losses_iou[-1]
         loss_dict['loss_map_pts'] = map_losses_pts[-1]
         loss_dict['loss_map_dir'] = map_losses_dir[-1]
-
-        # Planning Loss
-        ego_fut_gt = ego_fut_gt.squeeze(1)
-        ego_fut_masks = ego_fut_masks.squeeze(1).squeeze(1)
-        ego_fut_cmd = ego_fut_cmd.squeeze(1).squeeze(1)
-
-        batch, num_agent = all_traj_preds[-1].shape[:2]
-        agent_fut_preds = all_traj_preds[-1].view(batch, num_agent, self.fut_mode, self.fut_ts, 2)
-        agent_fut_cls_preds = all_traj_cls_scores[-1].view(batch, num_agent, self.fut_mode)
-        loss_plan_input = [ego_fut_preds, ego_fut_gt, ego_fut_masks, ego_fut_cmd,
-                           map_all_pts_preds[-1], map_all_cls_scores[-1].sigmoid(),
-                           all_bbox_preds[-1][..., 0:2], agent_fut_preds,
-                           all_cls_scores[-1].sigmoid(), agent_fut_cls_preds.sigmoid()]
-
-        loss_planning_dict = self.loss_planning(*loss_plan_input)
-        loss_dict['loss_plan_reg'] = loss_planning_dict['loss_plan_reg']
-        loss_dict['loss_plan_bound'] = loss_planning_dict['loss_plan_bound']
-        loss_dict['loss_plan_col'] = loss_planning_dict['loss_plan_col']
-        loss_dict['loss_plan_dir'] = loss_planning_dict['loss_plan_dir']
-
-        # loss from other decoder layers
-        num_dec_layer = 0
-        for loss_cls_i, loss_bbox_i in zip(losses_cls[:-1], losses_bbox[:-1]):
-            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
-            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
-            num_dec_layer += 1
         # loss from other decoder layers
         num_dec_layer = 0
         for map_loss_cls_i, map_loss_bbox_i, map_loss_iou_i, map_loss_pts_i, map_loss_dir_i in zip(
@@ -1661,8 +1837,7 @@ class VADHead(DETRHead):
             loss_dict[f'd{num_dec_layer}.loss_map_dir'] = map_loss_dir_i
             num_dec_layer += 1
 
-        # loss of proposal generated from encode feature map.
-        if enc_cls_scores is not None:
+        if not pred_map_only and enc_cls_scores is not None:
             binary_labels_list = [
                 torch.zeros_like(gt_labels_list[i])
                 for i in range(len(all_gt_labels_list))
