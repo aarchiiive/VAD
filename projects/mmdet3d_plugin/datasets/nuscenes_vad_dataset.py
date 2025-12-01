@@ -1844,7 +1844,10 @@ class VADCustomNuScenesDataset(NuScenesDataset):
                 thresholds= np.linspace(.5, 0.95, int(np.round((0.95 - .5) / .05)) + 1, endpoint=True)
             cls_aps = np.zeros((len(thresholds),self.NUM_MAPCLASSES))
             for i, thr in enumerate(thresholds):
-                print('\n' + f' Threshold {thr} '.center(50, '-'))
+                # print('\n' + f' Threshold {thr} '.center(50, '-'))
+                print('\n' + '-' * 70)
+                print(f"Threshold: {thr:.2f}".center(70))
+                print('-' * 70)
                 mAP, cls_ap = eval_map(
                                 map_results,
                                 map_annotations,
@@ -1989,8 +1992,12 @@ class VADCustomNuScenesDataset(NuScenesDataset):
             metrics_map = aggregated_sections.get(threshold, {})
             section_result = {}
             label_suffix = '' if threshold is None else f'_{threshold}'
-            section_label = 'Overall (2.0m)' if threshold is None else f'Threshold {threshold}'
+            section_label = 'Overall (2.0m)' if threshold is None else f'Threshold: {threshold}'
+            # print(section_label.center(70))
+            print('\n' + '-' * 70)
+            # print(f"Threshold: {thr:.2f}".center(70))
             print(section_label.center(70))
+            print('-' * 70)
             for cls in motion_cls_names:
                 gt_sum = metrics_map.get('gt', {}).get(cls, 0.0)
                 hit_sum = metrics_map.get('hit', {}).get(cls, 0.0)

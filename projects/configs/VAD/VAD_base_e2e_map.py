@@ -2,25 +2,26 @@ _base_ = [
     '../datasets/custom_nus-3d.py',
     '../_base_/default_runtime.py'
 ]
-#
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
-# If point cloud range is changed, the models should also change their point
-# cloud range accordingly
+# ===== Dataset / Geometry settings =====
+# Spatial coverage of each sample [xmin, ymin, zmin, xmax, ymax, zmax]
 point_cloud_range = [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0]
+# Voxel resolution used in BEV pipeline
 voxel_size = [0.15, 0.15, 4]
 
+# Input normalization for multiview images
 img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
-# For nuScenes we usually do 10-class detection
+# Detection classes (nuScenes 10-class split)
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 num_classes = len(class_names)
 
-# map has classes: divider, ped_crossing, boundary
+# Vectorized map classes + settings
 map_classes = ['divider', 'ped_crossing', 'boundary']
 map_num_vec = 100
 map_fixed_ptsnum_per_gt_line = 20 # now only support fixed_pts > 0
@@ -28,12 +29,43 @@ map_fixed_ptsnum_per_pred_line = 20
 map_eval_use_same_gt_sample_num_flag = True
 map_num_classes = len(map_classes)
 
+# Sensor modalities used in the dataset
 input_modality = dict(
     use_lidar=False,
     use_camera=True,
     use_radar=False,
     use_map=False,
     use_external=True)
+# Dataloader settings
+samples_per_gpu = 4
+workers_per_gpu = 4
+prefetch_factor = 4
+# ======================================
+
+# ===== Training hyperparameters =====
+# Number of frames per sample (history queue length)
+queue_length = 4
+# Total number of training epochs
+total_epochs = 60
+# Training scene subsampling (0 = use all scenes)
+num_train_scenes = 0
+# Whether to freeze image/pts backbones
+freeze_backbone = True
+# Whether to only predict map outputs (no agent motion prediction)
+pred_map_only = True
+# Pretrained checkpoint path for image backbone
+pretrained_ckpt = 'ckpts/resnet50-19c8e357.pth'
+# Optimizer learning rate & schedule
+base_lr = 2e-4
+weight_decay = 0.01
+backbone_lr_mult = 0.1
+grad_clip_norm = 35
+warmup_iters = 500
+warmup_ratio = 1.0 / 3
+min_lr_ratio = 1e-3
+# Logging interval for Text/TensorBoard/WandB
+log_interval = 10
+# ===================================
 
 _dim_ = 256
 _pos_dim_ = _dim_//2
@@ -41,14 +73,21 @@ _ffn_dim_ = _dim_*2
 _num_levels_ = 4
 bev_h_ = 200
 bev_w_ = 200
-queue_length = 4 # each sequence contains `queue_length` frames.
-total_epochs = 12
+
+experiment = dict(
+    name='VAD_base_e2e_map_only',
+    project='VAD',
+    use_timestamp=True,
+    tags=['baseline']
+)
 
 model = dict(
     type='VAD',
     use_grid_mask=True,
     video_test_mode=True,
-    pretrained=dict(img='torchvision://resnet50'),
+    pretrained=dict(img=pretrained_ckpt),
+    freeze_backbone=freeze_backbone,
+    pred_map_only=pred_map_only,
     img_backbone=dict(
         type='ResNet',
         depth=50,
@@ -68,6 +107,7 @@ model = dict(
         relu_before_extra_convs=True),
     pts_bbox_head=dict(
         type='VADHead',
+        pred_map_only=pred_map_only,
         map_thresh=0.5,
         dis_thresh=0.2,
         pe_normalization=True,
@@ -163,6 +203,7 @@ model = dict(
         map_code_weights=[1.0, 1.0, 1.0, 1.0],
         transformer=dict(
             type='VADPerceptionTransformer',
+            pred_map_only=pred_map_only,
             map_num_vec=map_num_vec,
             map_num_pts_per_vec=map_fixed_ptsnum_per_pred_line,
             rotate_prev_bev=True,
@@ -264,8 +305,8 @@ model = dict(
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=0.8),
-        loss_bbox=dict(type='L1Loss', loss_weight=0.1),
+            loss_weight=2.0),
+        loss_bbox=dict(type='L1Loss', loss_weight=0.25),
         loss_traj=dict(type='L1Loss', loss_weight=0.2),
         loss_traj_cls=dict(
             type='FocalLoss',
@@ -279,10 +320,10 @@ model = dict(
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=0.8),
+            loss_weight=2.0),
         loss_map_bbox=dict(type='L1Loss', loss_weight=0.0),
         loss_map_iou=dict(type='GIoULoss', loss_weight=0.0),
-        loss_map_pts=dict(type='PtsL1Loss', loss_weight=0.4),
+        loss_map_pts=dict(type='PtsL1Loss', loss_weight=1.0),
         loss_map_dir=dict(type='PtsDirCosLoss', loss_weight=0.005),
         loss_plan_reg=dict(type='L1Loss', loss_weight=1.0),
         loss_plan_bound=dict(type='PlanMapBoundLoss', loss_weight=1.0, dis_thresh=1.0),
@@ -296,16 +337,16 @@ model = dict(
         out_size_factor=4,
         assigner=dict(
             type='HungarianAssigner3D',
-            cls_cost=dict(type='FocalLossCost', weight=0.8),
-            reg_cost=dict(type='BBox3DL1Cost', weight=0.1),
+            cls_cost=dict(type='FocalLossCost', weight=2.0),
+            reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
             iou_cost=dict(type='IoUCost', weight=0.0), # Fake cost. This is just to make it compatible with DETR head.
             pc_range=point_cloud_range),
         map_assigner=dict(
             type='MapHungarianAssigner3D',
-            cls_cost=dict(type='FocalLossCost', weight=0.8),
+            cls_cost=dict(type='FocalLossCost', weight=2.0),
             reg_cost=dict(type='BBoxL1Cost', weight=0.0, box_format='xywh'),
             iou_cost=dict(type='IoUCost', iou_mode='giou', weight=0.0),
-            pts_cost=dict(type='OrderedPtsL1Cost', weight=0.4),
+            pts_cost=dict(type='OrderedPtsL1Cost', weight=1.0),
             pc_range=point_cloud_range))))
 
 dataset_type = 'VADCustomNuScenesDataset'
@@ -313,14 +354,14 @@ data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
 train_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
-    dict(type='PhotoMetricDistortionMultiViewImage'),
+    dict(type='CustomLoadMultiViewImageFromFiles', to_float32=True, num_workers=4),
+    dict(type='PhotoMetricDistortionMultiViewImage', num_workers=4),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
     dict(type='CustomObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='CustomObjectNameFilter', classes=class_names),
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='RandomScaleImageMultiViewImage', scales=[0.8]),
-    dict(type='PadMultiViewImage', size_divisor=32),
+    dict(type='NormalizeMultiviewImage', num_workers=4, **img_norm_cfg),
+    dict(type='RandomScaleImageMultiViewImage', scales=[0.8], num_workers=4),
+    dict(type='PadMultiViewImage', size_divisor=32, num_workers=4),
     dict(type='CustomDefaultFormatBundle3D', class_names=class_names, with_ego=True),
     dict(type='CustomCollect3D',\
          keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'ego_his_trajs',
@@ -328,7 +369,7 @@ train_pipeline = [
 ]
 
 test_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='CustomLoadMultiViewImageFromFiles', to_float32=True, num_workers=4),
     dict(type='LoadPointsFromFile',
          coord_type='LIDAR',
          load_dim=5,
@@ -337,7 +378,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
     dict(type='CustomObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='CustomObjectNameFilter', classes=class_names),
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='NormalizeMultiviewImage', num_workers=4, **img_norm_cfg),
     # dict(type='PadMultiViewImage', size_divisor=32),
     dict(
         type='MultiScaleFlipAug3D',
@@ -345,8 +386,8 @@ test_pipeline = [
         pts_scale_ratio=1,
         flip=False,
         transforms=[
-            dict(type='RandomScaleImageMultiViewImage', scales=[0.8]),
-            dict(type='PadMultiViewImage', size_divisor=32),
+            dict(type='RandomScaleImageMultiViewImage', scales=[0.8], num_workers=4),
+            dict(type='PadMultiViewImage', size_divisor=32, num_workers=4),
             dict(type='CustomDefaultFormatBundle3D', class_names=class_names, with_label=False, with_ego=True),
             dict(type='CustomCollect3D',\
                  keys=['points', 'gt_bboxes_3d', 'gt_labels_3d', 'img', 'fut_valid_flag',
@@ -355,8 +396,9 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=1,
-    workers_per_gpu=4,
+    samples_per_gpu=samples_per_gpu,
+    workers_per_gpu=workers_per_gpu,
+    prefetch_factor=prefetch_factor,
     train=dict(
         type=dataset_type,
         data_root=data_root,
@@ -375,7 +417,9 @@ data = dict(
         # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
         # and box_type_3d='Depth' in sunrgbd and scannet dataset.
         box_type_3d='LiDAR',
-        custom_eval_version='vad_nusc_detection_cvpr_2019'),
+        custom_eval_version='vad_nusc_detection_cvpr_2019',
+        num_scenes=num_train_scenes,
+        scene_tokens_file=None),
     val=dict(type=dataset_type,
              data_root=data_root,
              pc_range=point_cloud_range,
@@ -406,34 +450,45 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=2e-4,
+    lr=base_lr,
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.1),
+            'img_backbone': dict(lr_mult=backbone_lr_mult),
         }),
-    weight_decay=0.01)
+    weight_decay=weight_decay)
 
-optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+optimizer_config = dict(grad_clip=dict(max_norm=grad_clip_norm, norm_type=2))
 # learning policy
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=500,
-    warmup_ratio=1.0 / 3,
-    min_lr_ratio=1e-3)
+    warmup_iters=warmup_iters,
+    warmup_ratio=warmup_ratio,
+    min_lr_ratio=min_lr_ratio)
 
 evaluation = dict(interval=total_epochs, pipeline=test_pipeline, metric='bbox', map_metric='chamfer')
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-load_from = 'ckpts/VAD_base_stage_1.pth'
+
+wandb_init_kwargs = dict(
+    project=experiment['project'],
+    name=experiment['name'])
+if experiment.get('tags'):
+    wandb_init_kwargs['tags'] = experiment['tags']
+if experiment.get('notes'):
+    wandb_init_kwargs['notes'] = experiment['notes']
+
 log_config = dict(
-    interval=100,
+    interval=log_interval,
     hooks=[
         dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook')
+        dict(type='TensorboardLoggerHook'),
+        dict(
+            type='WandbLoggerHook',
+            init_kwargs=wandb_init_kwargs)
     ])
 # fp16 = dict(loss_scale=512.)
-# find_unused_parameters = True
+find_unused_parameters = True
 checkpoint_config = dict(interval=1, max_keep_ckpts=total_epochs)
 
 

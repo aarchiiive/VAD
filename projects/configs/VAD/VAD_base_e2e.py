@@ -1,3 +1,6 @@
+################################################################################
+# Base setup & plugin registry
+################################################################################
 _base_ = [
     '../datasets/custom_nus-3d.py',
     '../_base_/default_runtime.py'
@@ -5,7 +8,9 @@ _base_ = [
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
-# ===== Dataset / Geometry settings =====
+################################################################################
+# Dataset / geometry settings
+################################################################################
 # Spatial coverage of each sample [xmin, ymin, zmin, xmax, ymax, zmax]
 point_cloud_range = [-15.0, -30.0, -2.0, 15.0, 30.0, 2.0]
 # Voxel resolution used in BEV pipeline
@@ -36,9 +41,14 @@ input_modality = dict(
     use_radar=False,
     use_map=False,
     use_external=True)
-# ======================================
+# Dataloader settings
+samples_per_gpu = 1
+workers_per_gpu = 4
+prefetch_factor = 8
 
-# ===== Training hyperparameters =====
+################################################################################
+# Training hyperparameters
+################################################################################
 # Number of frames per sample (history queue length)
 queue_length = 4
 # Total number of training epochs
@@ -46,7 +56,11 @@ total_epochs = 60
 # Training scene subsampling (0 = use all scenes)
 num_train_scenes = 0
 # Whether to freeze image/pts backbones
-freeze_backbone = True
+freeze_backbone = False
+# Whether to only predict map outputs (no agent motion prediction)
+pred_map_only = False
+# Optional profiling flag
+enable_profiler = False
 # Pretrained checkpoint path for image backbone
 pretrained_ckpt = 'ckpts/resnet50-19c8e357.pth'
 # Optimizer learning rate & schedule
@@ -59,7 +73,6 @@ warmup_ratio = 1.0 / 3
 min_lr_ratio = 1e-3
 # Logging interval for Text/TensorBoard/WandB
 log_interval = 10
-# ===================================
 
 _dim_ = 256
 _pos_dim_ = _dim_//2
@@ -69,11 +82,24 @@ bev_h_ = 200
 bev_w_ = 200
 
 experiment = dict(
-    name='VAD_base_e2e',
+    name='VAD_base_e2e_map_only',
     project='VAD',
     use_timestamp=True,
     tags=['baseline']
 )
+
+################################################################################
+# WandB logging settings
+################################################################################
+wandb_init_kwargs = dict(
+    project=experiment['project'],
+    name=experiment['name'])
+if experiment.get('tags'):
+    wandb_init_kwargs['tags'] = experiment['tags']
+if experiment.get('notes'):
+    wandb_init_kwargs['notes'] = experiment['notes']
+
+################################################################################
 
 model = dict(
     type='VAD',
@@ -81,6 +107,7 @@ model = dict(
     video_test_mode=True,
     pretrained=dict(img=pretrained_ckpt),
     freeze_backbone=freeze_backbone,
+    pred_map_only=pred_map_only,
     img_backbone=dict(
         type='ResNet',
         depth=50,
@@ -99,7 +126,9 @@ model = dict(
         num_outs=_num_levels_,
         relu_before_extra_convs=True),
     pts_bbox_head=dict(
-        type='VADHead',
+        type='VADEgoHead',
+        pred_map_only=pred_map_only,
+        enable_profiler=enable_profiler,
         map_thresh=0.5,
         dis_thresh=0.2,
         pe_normalization=True,
@@ -195,6 +224,7 @@ model = dict(
         map_code_weights=[1.0, 1.0, 1.0, 1.0],
         transformer=dict(
             type='VADPerceptionTransformer',
+            pred_map_only=pred_map_only,
             map_num_vec=map_num_vec,
             map_num_pts_per_vec=map_fixed_ptsnum_per_pred_line,
             rotate_prev_bev=True,
@@ -387,9 +417,9 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=4,
-    workers_per_gpu=4,
-    prefetch_factor=4,
+    samples_per_gpu=samples_per_gpu,
+    workers_per_gpu=workers_per_gpu,
+    prefetch_factor=prefetch_factor,
     train=dict(
         type=dataset_type,
         data_root=data_root,
@@ -410,31 +440,39 @@ data = dict(
         box_type_3d='LiDAR',
         custom_eval_version='vad_nusc_detection_cvpr_2019',
         num_scenes=num_train_scenes,
-        scene_tokens_file=None),
-    val=dict(type=dataset_type,
-             data_root=data_root,
-             pc_range=point_cloud_range,
-             ann_file=data_root + 'vad_nuscenes_infos_temporal_val.pkl',
-             pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
-             classes=class_names, modality=input_modality, samples_per_gpu=1,
-             map_classes=map_classes,
-             map_ann_file=data_root + 'nuscenes_map_anns_val.json',
-             map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
-             map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
-             use_pkl_result=True,
-             custom_eval_version='vad_nusc_detection_cvpr_2019'),
-    test=dict(type=dataset_type,
-              data_root=data_root,
-              pc_range=point_cloud_range,
-              ann_file=data_root + 'vad_nuscenes_infos_temporal_val.pkl',
-              pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
-              classes=class_names, modality=input_modality, samples_per_gpu=1,
-              map_classes=map_classes,
-              map_ann_file=data_root + 'nuscenes_map_anns_val.json',
-              map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
-              map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
-              use_pkl_result=True,
-              custom_eval_version='vad_nusc_detection_cvpr_2019'),
+        scene_tokens_file=None,
+        # hard_sample=True
+    ),
+    val=dict(
+        type=dataset_type,
+        data_root=data_root,
+        pc_range=point_cloud_range,
+        ann_file=data_root + 'vad_nuscenes_infos_temporal_val.pkl',
+        pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
+        classes=class_names, modality=input_modality, samples_per_gpu=1,
+        map_classes=map_classes,
+        map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+        map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
+        map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
+        use_pkl_result=True,
+        custom_eval_version='vad_nusc_detection_cvpr_2019',
+        # hard_sample=True
+    ),
+    test=dict(
+        type=dataset_type,
+        data_root=data_root,
+        pc_range=point_cloud_range,
+        ann_file=data_root + 'vad_nuscenes_infos_temporal_val.pkl',
+        pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
+        classes=class_names, modality=input_modality, samples_per_gpu=1,
+        map_classes=map_classes,
+        map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+        map_fixed_ptsnum_per_line=map_fixed_ptsnum_per_gt_line,
+        map_eval_use_same_gt_sample_num_flag=map_eval_use_same_gt_sample_num_flag,
+        use_pkl_result=True,
+        custom_eval_version='vad_nusc_detection_cvpr_2019',
+        # hard_sample=True
+    ),
     shuffler_sampler=dict(type='DistributedGroupSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler')
 )
@@ -453,21 +491,13 @@ optimizer_config = dict(grad_clip=dict(max_norm=grad_clip_norm, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=warmup_iters,
+    warmup_iters=warmup_iters//samples_per_gpu,
     warmup_ratio=warmup_ratio,
     min_lr_ratio=min_lr_ratio)
 
 evaluation = dict(interval=total_epochs, pipeline=test_pipeline, metric='bbox', map_metric='chamfer')
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
-
-wandb_init_kwargs = dict(
-    project=experiment['project'],
-    name=experiment['name'])
-if experiment.get('tags'):
-    wandb_init_kwargs['tags'] = experiment['tags']
-if experiment.get('notes'):
-    wandb_init_kwargs['notes'] = experiment['notes']
 
 log_config = dict(
     interval=log_interval,
