@@ -22,7 +22,7 @@ from navsim.agents.vad.vad_config import VADConfig
 from navsim.common.dataclasses import SceneFilter, SensorConfig
 from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.abstract_feature_target_builder import AbstractTargetBuilder
-from vad_target_builder import VADTargetBuilder
+from tools.data_converter.vad_target_builder import VADTargetBuilder
 
 
 def _build_sensor_config(num_history_frames: int) -> SensorConfig:
