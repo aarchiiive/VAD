@@ -281,8 +281,8 @@ def main():
     eval_metrics = args.eval if args.eval else ['bbox']
     eval_kwargs = cfg.get('evaluation', {}).copy()
     for key in [
-            'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-            'rule'
+        'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
+        'rule'
     ]:
         eval_kwargs.pop(key, None)
     eval_kwargs.update(dict(metric=eval_metrics, **kwargs))
@@ -300,6 +300,9 @@ def main():
     mmcv.dump(format_state, format_state_path)
 
     evaluation_results = dataset.evaluate(outputs['bbox_results'], **eval_kwargs)
+
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
         # summary_paths = getattr(dataset, 'latest_summary_paths', [])
 
         # bundle = dict(

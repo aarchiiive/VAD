@@ -84,9 +84,16 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
             #    result = [(bbox_results, encode_mask_results(mask_results))
             #              for bbox_results, mask_results in result]
         if rank == 0:
-            
+
             for _ in range(batch_size * world_size):
                 prog_bar.update()
+
+    # Sync whether any rank produced mask predictions so every rank executes
+    # the same gather path (avoids hanging at collect_results_cpu barriers).
+    have_mask_tensor = torch.tensor([int(have_mask)],
+                                     device='cuda' if torch.cuda.is_available() else 'cpu')
+    dist.all_reduce(have_mask_tensor)
+    have_mask = bool(have_mask_tensor.item())
 
     # collect results from all ranks
     if gpu_collect:
@@ -148,7 +155,7 @@ def collect_results_cpu(result_part, size, tmpdir=None):
         bacause we change the sample of the evaluation stage to make sure that each gpu will handle continuous sample,
         '''
         #for res in zip(*part_list):
-        for res in part_list:  
+        for res in part_list:
             ordered_results.extend(list(res))
         # the dataloader may pad some samples
         ordered_results = ordered_results[:size]
