@@ -2,7 +2,7 @@ name: nuplan
 channels:
   - conda-forge
 dependencies:
-  - python=3.9
+  - python=3.8
   - pip=21.2.4
   - nb_conda_kernels
   - pip:

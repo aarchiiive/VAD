@@ -1,7 +1,7 @@
 # Exclude hidden files, init, tensorrt folders, protobuf generated files, markdown files, and DB model.py files
 exclude: ^(.*/\..*|.*__init__.py|.*_pb2.py|.*_pb2_grpc.py|.*.md|.*.database.*.models.py)$
 default_language_version:
-  python: python3.9
+  python: python3.8
 repos:
 - repo: https://github.com/pre-commit/pre-commit-hooks
   rev: v4.2.0
