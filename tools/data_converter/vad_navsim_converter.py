@@ -19,7 +19,7 @@ from hydra.utils import instantiate
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
 from navsim.agents.vad.vad_config import VADConfig
-from navsim.common.dataclasses import SceneFilter, SensorConfig
+from navsim.common.dataclasses import Scene, SceneFilter, SensorConfig
 from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.abstract_feature_target_builder import AbstractTargetBuilder
 from tools.data_converter.vad_target_builder import VADTargetBuilder
@@ -202,11 +202,30 @@ def _tensor_to_numpy(value: Any) -> Any:
     return value
 
 
+def _cache_local_vector_map(
+    scene: Scene,
+    frame_token: str,
+    target_builder: AbstractTargetBuilder,
+    cache_dir: Path,
+) -> Optional[Path]:
+    """Persist local vector map data following the NavSim log directory structure."""
+    log_dir = cache_dir / scene.scene_metadata.log_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = log_dir / f"{frame_token}.pkl"
+    if cache_path.exists():
+        return cache_path
+
+    local_vector_map = target_builder.get_local_vector_map(scene, frame_token)
+    mmcv.dump(local_vector_map, str(cache_path))
+    return cache_path
+
+
 def _scene_to_info(
     scene_loader: SceneLoader,
     token: str,
     target_builder: AbstractTargetBuilder,
     max_sweeps: int,
+    local_map_cache_dir: Optional[Path],
 ) -> Dict[str, Any]:
     """Convert a NavSim scene token into an info dictionary."""
     scene = scene_loader.get_scene_from_token(token)
@@ -253,7 +272,11 @@ def _scene_to_info(
         info["can_bus"] = targets_np["can_bus"]
 
     frame_token = raw_frame["token"]
-    info["local_vector_map"] = target_builder.get_local_vector_map(scene, frame_token)
+    if local_map_cache_dir is not None:
+        map_cache_path = _cache_local_vector_map(scene, frame_token, target_builder, local_map_cache_dir)
+        info["local_vector_map_path"] = str(map_cache_path) if map_cache_path is not None else ""
+    else:
+        info["local_vector_map"] = target_builder.get_local_vector_map(scene, frame_token)
 
     # Ground-truth fields
     info["fut_valid_flag"] = bool(targets_np["fut_valid_flag"])
@@ -282,12 +305,41 @@ def _generate_infos(
     tokens: List[str],
     target_builder: AbstractTargetBuilder,
     max_sweeps: int,
+    local_map_cache_dir: Optional[Path],
 ) -> List[Dict[str, Any]]:
     """Generate info dictionaries for a provided token list."""
     infos: List[Dict[str, Any]] = []
     for token in tqdm(tokens, desc="Generating NavSim infos"):
-        infos.append(_scene_to_info(scene_loader, token, target_builder, max_sweeps))
+        infos.append(
+            _scene_to_info(
+                scene_loader=scene_loader,
+                token=token,
+                target_builder=target_builder,
+                max_sweeps=max_sweeps,
+                local_map_cache_dir=local_map_cache_dir,
+            )
+        )
     return infos
+
+
+def _resolve_vector_map_cache_root(data_root: Path, vector_map_root: Optional[Path]) -> Path:
+    """Determine where vector map pickles should be cached."""
+    if vector_map_root is not None:
+        return vector_map_root
+
+    dataset_root: Optional[Path] = None
+    navsim_logs_root: Optional[Path] = None
+    for parent in [data_root] + list(data_root.parents):
+        if parent.name == "navsim_logs":
+            navsim_logs_root = parent
+            dataset_root = parent.parent
+            break
+
+    if navsim_logs_root is not None and dataset_root is not None:
+        relative = data_root.relative_to(navsim_logs_root)
+        return dataset_root / "vector_maps" / relative
+
+    return data_root / "vector_maps"
 
 
 def _prepare_scene_filter(base_filter: SceneFilter, desired_logs: List[str]) -> SceneFilter:
@@ -314,6 +366,7 @@ def create_navsim_infos(
     train_count: Optional[int] = None,
     val_start: int = 0,
     val_count: Optional[int] = None,
+    vector_map_root: Optional[Path] = None,
 ) -> None:
     """Main routine producing train/val info files for NavSim VAD."""
     GlobalHydra.instance().clear()
@@ -387,8 +440,22 @@ def create_navsim_infos(
     train_tokens, train_logs = _select_tokens(train_loader, train_start, train_count)
     val_tokens, val_logs = _select_tokens(val_loader, val_start, val_count)
 
-    train_infos = _generate_infos(train_loader, train_tokens, target_builder, max_sweeps)
-    val_infos = _generate_infos(val_loader, val_tokens, target_builder, max_sweeps)
+    local_map_cache_dir = _resolve_vector_map_cache_root(data_root, vector_map_root)
+
+    train_infos = _generate_infos(
+        scene_loader=train_loader,
+        tokens=train_tokens,
+        target_builder=target_builder,
+        max_sweeps=max_sweeps,
+        local_map_cache_dir=local_map_cache_dir,
+    )
+    val_infos = _generate_infos(
+        scene_loader=val_loader,
+        tokens=val_tokens,
+        target_builder=target_builder,
+        max_sweeps=max_sweeps,
+        local_map_cache_dir=local_map_cache_dir,
+    )
 
     effective_interval = train_filter.frame_interval
 
@@ -460,6 +527,29 @@ def create_navsim_infos(
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Example commands (run from repository root):
+    Full conversion:
+    python tools/data_converter/vad_navsim_converter.py \
+      --data-root /home/work/datasets/openscene-v1.1/navsim_logs/trainval \
+      --sensor-root /home/work/datasets/openscene-v1.1/sensor_blobs/trainval \
+      --output-dir data/navsim \
+      --split navtrain \
+      --max-sweeps 10 \
+      --fut-horizon 4.0 \
+      --interval 0.5 \
+      --mode navsim
+
+    Subset (first 100 training samples only):
+    python tools/data_converter/vad_navsim_converter.py \
+      --data-root /home/work/datasets/openscene-v1.1/navsim_logs/trainval \
+      --sensor-root /home/work/datasets/openscene-v1.1/sensor_blobs/trainval \
+      --output-dir data/navsim_subset \
+      --split navtrain \
+      --train-count 100 \
+      --val-count 20
+    """
+
     parser = argparse.ArgumentParser(description="Convert NavSim logs into VAD info files.")
     parser.add_argument("--data-root", type=Path, required=True, help="Path to NavSim log directory.")
     parser.add_argument("--sensor-root", type=Path, required=True, help="Path to NavSim sensor directory.")
@@ -505,6 +595,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum number of validation tokens to convert (subset).",
     )
+    parser.add_argument(
+        "--vector-map-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root directory to store cached vector map pickles. "
+            "Defaults to <dataset_root>/vector_maps/<relative_data_root> mirroring navsim_logs layout."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -532,6 +631,7 @@ def main() -> None:
         train_count=args.train_count,
         val_start=args.val_start,
         val_count=args.val_count,
+        vector_map_root=args.vector_map_root,
     )
 
 
